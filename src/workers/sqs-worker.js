@@ -9,10 +9,11 @@ import { logInfo, logError } from '../utils/logger.js';
 class SQSWorker {
   constructor() {
     this.running = false;
-    this.queues = ['transactions', 'notifications'];
+    this.queues = ['transactions', 'notifications', 'webhooks'];
     this.processingCounts = {
       transactions: 0,
-      notifications: 0
+      notifications: 0,
+      webhooks: 0
     };
     // Map para controlar concurrencia por ticket_type_id
     // Evita locks cuando múltiples workers actualizan el mismo ticket_type
@@ -101,6 +102,8 @@ class SQSWorker {
         await this.processTransactionMessage(message);
       } else if (queueName === 'notifications') {
         await this.processNotificationMessage(message);
+      } else if (queueName === 'webhooks') {
+        await this.processWebhookMessage(message);
       }
 
       // Eliminar mensaje exitoso de la cola
@@ -180,6 +183,94 @@ class SQSWorker {
     // - Analytics/tracking
 
     await logInfo('notification', `Notificación ${type} procesada`, null, { type, recipientEmail: data.email });
+  }
+
+  /**
+   * Procesar mensaje de webhooks de pasarelas de pago
+   * @param {Object} message - Mensaje con webhook data
+   */
+  async processWebhookMessage(message) {
+    const { operation, data } = message.body;
+
+    if (operation === 'process_webhook') {
+      await this.handlePaymentWebhook(data);
+    } else {
+      throw new Error(`Operación de webhook desconocida: ${operation}`);
+    }
+  }
+
+  /**
+   * Procesar webhook de pasarela de pago
+   * @param {Object} data - Datos del webhook
+   */
+  async handlePaymentWebhook(data) {
+    const {
+      transaction_id,
+      payment_gateway,
+      status,
+      payment_gateway_transaction_id,
+      payment_method,
+      gateway_response
+    } = data;
+
+    console.log(`💳 Procesando webhook de ${payment_gateway} para transacción ${transaction_id}:`, status);
+
+    // Buscar transacción
+    const transaction = await TransactionModel.findById(transaction_id);
+
+    if (!transaction) {
+      await logError('webhook', 'Transacción no encontrada en webhook', transaction_id, {
+        payment_gateway,
+        status
+      });
+      throw new Error(`Transacción no encontrada: ${transaction_id}`);
+    }
+
+    // Determinar nuevo estado basado en respuesta de pasarela
+    let newStatus;
+    let note;
+
+    if (status === 'success' || status === 'approved' || status === 'completed') {
+      newStatus = 'revision';
+      note = `Pago aprobado por ${payment_gateway}`;
+    } else if (status === 'failed' || status === 'rejected' || status === 'declined') {
+      newStatus = 'erroneo';
+      note = `Pago rechazado por ${payment_gateway}`;
+    } else if (status === 'pending') {
+      // Mantener en procesando, solo loguear
+      await logInfo('webhook', 'Pago pendiente, manteniendo estado', transaction_id, {
+        payment_gateway,
+        status
+      });
+      console.log(`⏳ Pago pendiente para transacción ${transaction_id}`);
+      return; // No actualizar estado
+    } else {
+      await logError('webhook', 'Estado de pago desconocido', transaction_id, {
+        payment_gateway,
+        status
+      });
+      throw new Error(`Estado de pago desconocido: ${status}`);
+    }
+
+    // Actualizar transacción con retry automático
+    const updatedTransaction = await TransactionModel.updateStatus(
+      transaction_id,
+      newStatus,
+      {
+        payment_gateway_transaction_id,
+        payment_gateway_response: gateway_response,
+        payment_method,
+        note
+      }
+    );
+
+    await logInfo('webhook', `Webhook procesado: transacción ${transaction_id} → ${newStatus}`, transaction_id, {
+      payment_gateway,
+      new_status: newStatus,
+      previous_status: transaction.status
+    });
+
+    console.log(`✅ Webhook procesado: ${transaction_id} → ${newStatus}`);
   }
 
   // ========================================================================

@@ -26,13 +26,15 @@ class SQSService {
     // URLs de las colas
     this.queues = {
       transactions: process.env.SQS_TRANSACTIONS_QUEUE_URL,
-      notifications: process.env.SQS_NOTIFICATIONS_QUEUE_URL
+      notifications: process.env.SQS_NOTIFICATIONS_QUEUE_URL,
+      webhooks: process.env.SQS_WEBHOOKS_QUEUE_URL
     };
 
     console.log(`✅ SQS Service configurado en región: ${region}`);
     console.log(`📬 Colas configuradas:`, {
       transactions: this.queues.transactions ? '✓' : '✗',
-      notifications: this.queues.notifications ? '✓' : '✗'
+      notifications: this.queues.notifications ? '✓' : '✗',
+      webhooks: this.queues.webhooks ? '✓' : '✗'
     });
   }
 
