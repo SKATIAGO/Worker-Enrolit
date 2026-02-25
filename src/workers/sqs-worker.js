@@ -227,8 +227,8 @@ class SQSWorker {
       const pool = getPool();
       const [races] = await pool.query(
         `SELECT 
-          title, 
-          start_date, 
+          name as title, 
+          event_date as start_date, 
           location,
           image_url,
           kit_pickup_info,
