@@ -20,6 +20,7 @@
   "license": "ISC",
   "dependencies": {
     "@aws-sdk/client-sqs": "^3.658.0",
+    "axios": "^1.13.5",
     "dotenv": "^16.4.5",
     "mysql2": "^3.11.5",
     "uuid": "^11.0.3"
