@@ -16,21 +16,22 @@ export class TransactionModel {
     const connection = await pool.getConnection();
     
     try {
-      // Timeout de 10 segundos para la transacción
-      await connection.query('SET SESSION innodb_lock_wait_timeout = 10');
+      // Timeout reducido ya que no usamos SELECT FOR UPDATE
+      // Solo el UPDATE atómico necesita un lock breve
+      await connection.query('SET SESSION innodb_lock_wait_timeout = 5');
       
       await connection.beginTransaction();
       
       // Generar UUID para la transacción (o usar el proporcionado si viene de SQS)
       const transactionId = transactionData.id || uuidv4();
       
-      // Verificar disponibilidad de tickets CON BLOQUEO
+      // Verificar disponibilidad de tickets SIN BLOQUEO (optimista)
+      // El bloqueo real ocurrirá en el UPDATE atómico más adelante
       const [ticketType] = await connection.query(
         `SELECT tt.*, r.status as race_status, r.id as race_id 
          FROM ticket_types tt 
          JOIN races r ON tt.race_id = r.id 
-         WHERE tt.id = ? AND tt.is_active = TRUE
-         FOR UPDATE`,
+         WHERE tt.id = ? AND tt.is_active = TRUE`,
         [transactionData.ticket_type_id]
       );
       
@@ -40,7 +41,7 @@ export class TransactionModel {
       
       const ticket = ticketType[0];
       
-      // Validar disponibilidad ANTES de insertar
+      // Validación optimista (puede cambiar antes del UPDATE, pero el UPDATE validará)
       const availableNow = ticket.available_quantity - ticket.sold_quantity;
       if (availableNow < transactionData.quantity) {
         throw new Error(`Solo quedan ${availableNow} tickets disponibles (solicitaste ${transactionData.quantity})`);
@@ -90,7 +91,9 @@ export class TransactionModel {
       
       console.log(`📝 Transacción ${transactionId} creada, reservando ${transactionData.quantity} tickets...`);
       
-      // Reservar tickets (incrementar sold_quantity CON VALIDACIÓN)
+      // ACTUALIZACIÓN ATÓMICA: Reservar tickets solo si hay disponibilidad
+      // Este UPDATE es el único punto de bloqueo, pero es muy breve (milisegundos)
+      // Si múltiples workers intentan actualizar simultáneamente, solo uno tendrá éxito
       const [updateResult] = await connection.query(
         `UPDATE ticket_types 
          SET sold_quantity = sold_quantity + ? 
@@ -100,12 +103,12 @@ export class TransactionModel {
       
       // CRÍTICO: Verificar que se actualizó una fila
       if (updateResult.affectedRows === 0) {
-        await logError('ticket_type', 'Sobreventa detectada', transactionData.ticket_type_id, { 
+        // Otro worker se adelantó o no hay tickets suficientes
+        await logError('ticket_type', 'No se pudieron reservar tickets (posible sobreventa o race condition)', transactionData.ticket_type_id, { 
           transaction_id: transactionId,
-          requested_quantity: transactionData.quantity,
-          available: availableNow
+          requested_quantity: transactionData.quantity
         });
-        throw new Error('No se pudieron reservar los tickets (posible sobreventa detectada)');
+        throw new Error('No hay tickets suficientes disponibles en este momento. Por favor, intenta nuevamente.');
       }
       
       await logInfo('transaction', 'Transacción creada vía SQS', transactionId, { 
