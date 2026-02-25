@@ -273,101 +273,112 @@ export class TransactionModel {
       // ESTADO: REVISION - Generar números de corredor y encolar notificación
       // ========================================================================
       if (newStatus === 'revision') {
-        console.log(`🎫 Generando números de corredor para transacción ${transactionId}...`);
-        
-        // 1. Obtener configuración del ticket_type y último número
-        const bibInfo = await ParticipantModel.getLastBibNumber(
-          transaction.race_id, 
-          transaction.ticket_type_id,
-          connection
-        );
-        
-        // 2. Extraer participantes de buyer_data
-        const buyerData = JSON.parse(transaction.buyer_data || '{}');
-        let participants = buyerData.participants || [];
-        
-        if (participants.length === 0) {
-          // Si no hay participants array, crear uno con los datos del comprador
-          participants = [{
-            first_name: transaction.buyer_name.split(' ')[0],
-            last_name: transaction.buyer_name.split(' ').slice(1).join(' '),
-            email: transaction.buyer_email,
-            phone: transaction.buyer_phone,
-            dni: transaction.buyer_dni
-          }];
-        }
-        
-        // 3. Generar números de corredor consecutivos
-        const startBib = bibInfo.lastBib + 1;
-        const padding = bibInfo.padding;
-        const createdParticipants = [];
-        
-        for (let i = 0; i < participants.length; i++) {
-          const bibNumber = String(startBib + i).padStart(padding, '0');
-          const participant = participants[i];
+        try {
+          console.log(`🎫 Generando números de corredor para transacción ${transactionId}...`);
           
-          // Crear participante en BD
-          const participantData = {
-            transaction_id: transactionId,
-            race_id: transaction.race_id,
-            bib_number: bibNumber,
-            first_name: participant.first_name,
-            last_name: participant.last_name,
-            email: participant.email,
-            phone: participant.phone,
-            dni: participant.dni,
-            tshirt_size: participant.tshirt_size,
-            emergency_contact: participant.emergency_contact,
-            emergency_phone: participant.emergency_phone
-          };
-          
-          await ParticipantModel.create(participantData);
-          createdParticipants.push({ ...participant, bib_number: bibNumber });
-          
-          console.log(`✅ Participante ${participant.first_name} ${participant.last_name} - Número: ${bibNumber}`);
-        }
-        
-        // 4. Encolar notificación de email
-        if (sqsService.enabled) {
-          await sqsService.sendMessage('notifications', {
-            type: 'payment_confirmed',
-            data: {
-              transaction_id: transactionId,
-              buyer_email: transaction.buyer_email,
-              buyer_name: transaction.buyer_name,
-              race_id: transaction.race_id,
-              participants: createdParticipants
-            }
-          });
-          console.log(`📧 Email de confirmación encolado para ${transaction.buyer_email}`);
-        }
-        
-        // 5. Verificar si debe auto-completarse
-        const autoComplete = await SettingsModel.isAutoCompleteEnabled();
-        if (autoComplete) {
-          console.log(`⚡ Auto-complete habilitado, pasando a estado completado...`);
-          
-          // Actualizar a completado (recursivo, pero con control de versión)
-          const [autoCompleteResult] = await connection.query(
-            `UPDATE transactions 
-             SET status = 'completado', 
-                 completed_at = NOW(),
-                 version = version + 1
-             WHERE id = ? AND version = ?`,
-            [transactionId, updates.version]
+          // 1. Obtener configuración del ticket_type y último número
+          const bibInfo = await ParticipantModel.getLastBibNumber(
+            transaction.race_id, 
+            transaction.ticket_type_id,
+            connection
           );
           
-          if (autoCompleteResult.affectedRows > 0) {
-            // Incrementar participantes de la carrera
-            await connection.query(
-              `UPDATE races 
-               SET current_participants = current_participants + ? 
-               WHERE id = ?`,
-              [transaction.quantity, transaction.race_id]
+          // 2. Extraer participantes de buyer_data
+          const buyerData = JSON.parse(transaction.buyer_data || '{}');
+          let participants = buyerData.participants || [];
+          
+          if (participants.length === 0) {
+            // Si no hay participants array, crear uno con los datos del comprador
+            participants = [{
+              first_name: transaction.buyer_name.split(' ')[0],
+              last_name: transaction.buyer_name.split(' ').slice(1).join(' '),
+              email: transaction.buyer_email,
+              phone: transaction.buyer_phone,
+              dni: transaction.buyer_dni
+            }];
+          }
+          
+          // 3. Generar números de corredor consecutivos
+          const startBib = bibInfo.lastBib + 1;
+          const padding = bibInfo.padding;
+          const createdParticipants = [];
+          
+          for (let i = 0; i < participants.length; i++) {
+            const bibNumber = String(startBib + i).padStart(padding, '0');
+            const participant = participants[i];
+            
+            // Crear participante en BD
+            const participantData = {
+              transaction_id: transactionId,
+              race_id: transaction.race_id,
+              bib_number: bibNumber,
+              first_name: participant.first_name,
+              last_name: participant.last_name,
+              email: participant.email,
+              phone: participant.phone,
+              dni: participant.dni,
+              tshirt_size: participant.tshirt_size,
+              emergency_contact: participant.emergency_contact,
+              emergency_phone: participant.emergency_phone
+            };
+            
+            await ParticipantModel.create(participantData);
+            createdParticipants.push({ ...participant, bib_number: bibNumber });
+            
+            console.log(`✅ Participante ${participant.first_name} ${participant.last_name} - Número: ${bibNumber}`);
+          }
+          
+          // 4. Encolar notificación de email
+          if (sqsService.enabled) {
+            await sqsService.sendMessage('notifications', {
+              type: 'payment_confirmed',
+              data: {
+                transaction_id: transactionId,
+                buyer_email: transaction.buyer_email,
+                buyer_name: transaction.buyer_name,
+                race_id: transaction.race_id,
+                participants: createdParticipants
+              }
+            });
+            console.log(`📧 Email de confirmación encolado para ${transaction.buyer_email}`);
+          }
+          
+          // 5. Verificar si debe auto-completarse
+          const autoComplete = await SettingsModel.isAutoCompleteEnabled();
+          if (autoComplete) {
+            console.log(`⚡ Auto-complete habilitado, pasando a estado completado...`);
+            
+            // Actualizar a completado (recursivo, pero con control de versión)
+            const [autoCompleteResult] = await connection.query(
+              `UPDATE transactions 
+               SET status = 'completado', 
+                   completed_at = NOW(),
+                   version = version + 1
+               WHERE id = ? AND version = ?`,
+              [transactionId, updates.version]
             );
             
-            console.log(`✅ Transacción auto-completada: ${transactionId}`);
+            if (autoCompleteResult.affectedRows > 0) {
+              // Incrementar participantes de la carrera
+              await connection.query(
+                `UPDATE races 
+                 SET current_participants = current_participants + ? 
+                 WHERE id = ?`,
+                [transaction.quantity, transaction.race_id]
+              );
+              
+              console.log(`✅ Transacción auto-completada: ${transactionId}`);
+            }
           }
+        } catch (error) {
+          console.error(`❌ Error generando participantes para transacción ${transactionId}:`, error);
+          await AuditService.logCriticalError('transaction', transactionId, error, {
+            step: 'participant_generation',
+            race_id: transaction.race_id,
+            ticket_type_id: transaction.ticket_type_id
+          });
+          // No lanzar error, solo registrar - la transacción quedará en revisión
+          // y se pueden generar los participantes manualmente después
         }
       }
       

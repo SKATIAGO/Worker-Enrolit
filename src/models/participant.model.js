@@ -135,6 +135,9 @@ export class ParticipantModel {
     
     const startNumber = ticketType[0].bib_number_start || 1000;
     
+    // Aumentar timeout temporalmente para el FOR UPDATE (30 segundos)
+    await pool.query('SET SESSION innodb_lock_wait_timeout = 30');
+    
     // Obtener el último número asignado CON LOCK
     const [result] = await pool.query(
       `SELECT COALESCE(MAX(CAST(bib_number AS UNSIGNED)), ?) as last_bib 
