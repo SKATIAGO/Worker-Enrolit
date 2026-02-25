@@ -284,17 +284,17 @@ export class TransactionModel {
         
         // 2. Extraer participantes de buyer_data
         const buyerData = JSON.parse(transaction.buyer_data || '{}');
-        const participants = buyerData.participants || [];
+        let participants = buyerData.participants || [];
         
         if (participants.length === 0) {
           // Si no hay participants array, crear uno con los datos del comprador
-          participants.push({
+          participants = [{
             first_name: transaction.buyer_name.split(' ')[0],
             last_name: transaction.buyer_name.split(' ').slice(1).join(' '),
             email: transaction.buyer_email,
             phone: transaction.buyer_phone,
             dni: transaction.buyer_dni
-          });
+          }];
         }
         
         // 3. Generar números de corredor consecutivos
