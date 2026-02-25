@@ -307,7 +307,7 @@ export class TransactionModel {
             const bibNumber = String(startBib + i).padStart(padding, '0');
             const participant = participants[i];
             
-            // Crear participante en BD
+            // Crear participante en BD (usando la misma conexión de la transacción)
             const participantData = {
               transaction_id: transactionId,
               race_id: transaction.race_id,
@@ -322,7 +322,7 @@ export class TransactionModel {
               emergency_phone: participant.emergency_phone
             };
             
-            await ParticipantModel.create(participantData);
+            await ParticipantModel.create(participantData, connection);
             createdParticipants.push({ ...participant, bib_number: bibNumber });
             
             console.log(`✅ Participante ${participant.first_name} ${participant.last_name} - Número: ${bibNumber}`);

@@ -11,10 +11,11 @@ export class ParticipantModel {
   /**
    * Crear un nuevo participante
    * @param {Object} participantData - Datos del participante
+   * @param {Object} connection - Conexión opcional de base de datos
    * @returns {Promise<Object>} - Participante creado
    */
-  static async create(participantData) {
-    const pool = getPool();
+  static async create(participantData, connection = null) {
+    const pool = connection || getPool();
     const participantId = participantData.id || uuidv4();
     
     try {
@@ -121,6 +122,11 @@ export class ParticipantModel {
   static async getLastBibNumber(raceId, ticketTypeId, connection = null) {
     const pool = connection || getPool();
     
+    // Aumentar timeout para el FOR UPDATE (30 segundos)
+    if (connection) {
+      await connection.query('SET SESSION innodb_lock_wait_timeout = 30');
+    }
+    
     // Obtener configuración del tipo de ticket
     const [ticketType] = await pool.query(
       `SELECT bib_number_start, bib_number_padding 
@@ -134,9 +140,6 @@ export class ParticipantModel {
     }
     
     const startNumber = ticketType[0].bib_number_start || 1000;
-    
-    // Aumentar timeout temporalmente para el FOR UPDATE (30 segundos)
-    await pool.query('SET SESSION innodb_lock_wait_timeout = 30');
     
     // Obtener el último número asignado CON LOCK
     const [result] = await pool.query(
