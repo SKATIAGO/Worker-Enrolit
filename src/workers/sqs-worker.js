@@ -14,6 +14,10 @@ class SQSWorker {
       transactions: 0,
       notifications: 0
     };
+    // Map para controlar concurrencia por ticket_type_id
+    // Evita locks cuando múltiples workers actualizan el mismo ticket_type
+    this.ticketTypeLocks = new Map();
+    this.maxConcurrentPerTicketType = 2; // Máximo 2 UPDATEs simultáneos por ticket_type
   }
 
   /**
@@ -182,21 +186,49 @@ class SQSWorker {
   // ========================================================================
 
   async createTransaction(data) {
-    try {
-      const transaction = await TransactionModel.create(data);
-      await logInfo('transaction', 'Transacción creada vía SQS', transaction.id, { 
-        ticket_type_id: data.ticket_type_id,
-        quantity: data.quantity 
-      });
-      return transaction;
-    } catch (error) {
-      await logError('transaction', 'Error al crear transacción vía SQS', data.id, { 
-        error: error.message,
-        ticket_type_id: data.ticket_type_id,
-        quantity: data.quantity
-      });
-      
-      throw error;
+    const maxRetries = 3;
+    const ticketTypeId = data.ticket_type_id;
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        // Adquirir lock antes de procesar (limita concurrencia por ticket_type)
+        await this.acquireLock(ticketTypeId);
+        
+        try {
+          const transaction = await TransactionModel.create(data);
+          await logInfo('transaction', 'Transacción creada vía SQS', transaction.id, { 
+            ticket_type_id: data.ticket_type_id,
+            quantity: data.quantity,
+            attempt 
+          });
+          return transaction;
+        } finally {
+          // Siempre liberar el lock, haya éxito o error
+          this.releaseLock(ticketTypeId);
+        }
+        
+      } catch (error) {
+        // Si es lock timeout y quedan reintentos, esperar con exponential backoff
+        const isLockTimeout = error.message && error.message.includes('Lock wait timeout');
+        
+        if (isLockTimeout && attempt < maxRetries) {
+          const delay = Math.pow(2, attempt) * 100; // 200ms, 400ms, 800ms
+          console.log(`⏳ Lock timeout en ticket_type ${ticketTypeId}, reintento ${attempt}/${maxRetries} en ${delay}ms`);
+          await this.sleep(delay);
+          continue; // Reintentar
+        }
+        
+        // Si no es lock timeout o ya no hay más reintentos, loguear y lanzar error
+        await logError('transaction', 'Error al crear transacción vía SQS', data.id, { 
+          error: error.message,
+          ticket_type_id: data.ticket_type_id,
+          quantity: data.quantity,
+          attempt,
+          maxRetries
+        });
+        
+        throw error;
+      }
     }
   }
 
@@ -247,6 +279,54 @@ class SQSWorker {
       queues: this.queues,
       processingCounts: this.processingCounts
     };
+  }
+
+  // ========================================================================
+  // Control de Concurrencia por ticket_type_id
+  // ========================================================================
+
+  /**
+   * Adquirir lock para procesar un ticket_type específico
+   * Limita la cantidad de UPDATEs simultáneos al mismo ticket_type
+   * para reducir contención de locks en la base de datos
+   * @param {number} ticketTypeId - ID del ticket_type
+   */
+  async acquireLock(ticketTypeId) {
+    if (!this.ticketTypeLocks.has(ticketTypeId)) {
+      this.ticketTypeLocks.set(ticketTypeId, { count: 0, queue: [] });
+    }
+    
+    const lock = this.ticketTypeLocks.get(ticketTypeId);
+    
+    // Si ya hay demasiadas operaciones simultáneas en este ticket_type, esperar
+    if (lock.count >= this.maxConcurrentPerTicketType) {
+      await new Promise(resolve => lock.queue.push(resolve));
+    }
+    
+    lock.count++;
+  }
+
+  /**
+   * Liberar lock de un ticket_type
+   * Permite que la siguiente operación en cola proceda
+   * @param {number} ticketTypeId - ID del ticket_type
+   */
+  releaseLock(ticketTypeId) {
+    const lock = this.ticketTypeLocks.get(ticketTypeId);
+    if (!lock) return;
+    
+    lock.count--;
+    
+    // Si hay operaciones esperando en la cola, liberar la siguiente
+    if (lock.queue.length > 0) {
+      const next = lock.queue.shift();
+      next();
+    }
+    
+    // Limpiar el Map si no hay operaciones activas ni en cola
+    if (lock.count === 0 && lock.queue.length === 0) {
+      this.ticketTypeLocks.delete(ticketTypeId);
+    }
   }
 }
 
