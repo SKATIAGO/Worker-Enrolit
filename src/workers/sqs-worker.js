@@ -17,7 +17,7 @@ class SQSWorker {
     // Map para controlar concurrencia por ticket_type_id
     // Evita locks cuando múltiples workers actualizan el mismo ticket_type
     this.ticketTypeLocks = new Map();
-    this.maxConcurrentPerTicketType = 2; // Máximo 2 UPDATEs simultáneos por ticket_type
+    this.maxConcurrentPerTicketType = 1; // SERIALIZAR operaciones por ticket_type (0 locks)
   }
 
   /**
@@ -208,12 +208,16 @@ class SQSWorker {
         }
         
       } catch (error) {
-        // Si es lock timeout y quedan reintentos, esperar con exponential backoff
-        const isLockTimeout = error.message && error.message.includes('Lock wait timeout');
+        // Si es error de lock (timeout o deadlock) y quedan reintentos, esperar con exponential backoff
+        const isLockError = error.message && (
+          error.message.includes('Lock wait timeout') || 
+          error.message.includes('Deadlock found')
+        );
         
-        if (isLockTimeout && attempt < maxRetries) {
+        if (isLockError && attempt < maxRetries) {
           const delay = Math.pow(2, attempt) * 100; // 200ms, 400ms, 800ms
-          console.log(`⏳ Lock timeout en ticket_type ${ticketTypeId}, reintento ${attempt}/${maxRetries} en ${delay}ms`);
+          const errorType = error.message.includes('Deadlock') ? 'Deadlock' : 'Lock timeout';
+          console.log(`⏳ ${errorType} en ticket_type ${ticketTypeId}, reintento ${attempt}/${maxRetries} en ${delay}ms`);
           await this.sleep(delay);
           continue; // Reintentar
         }
