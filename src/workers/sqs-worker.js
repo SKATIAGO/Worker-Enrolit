@@ -189,11 +189,12 @@ class SQSWorker {
     const maxRetries = 3;
     const ticketTypeId = data.ticket_type_id;
     
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      try {
-        // Adquirir lock antes de procesar (limita concurrencia por ticket_type)
-        await this.acquireLock(ticketTypeId);
-        
+    // Adquirir lock UNA SOLA VEZ para todos los reintentos
+    // Evita deadlocks entre reintentos simultáneos
+    await this.acquireLock(ticketTypeId);
+    
+    try {
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
           const transaction = await TransactionModel.create(data);
           await logInfo('transaction', 'Transacción creada vía SQS', transaction.id, { 
@@ -202,37 +203,37 @@ class SQSWorker {
             attempt 
           });
           return transaction;
-        } finally {
-          // Siempre liberar el lock, haya éxito o error
-          this.releaseLock(ticketTypeId);
+          
+        } catch (error) {
+          // Si es error de lock (timeout o deadlock) y quedan reintentos, esperar con exponential backoff
+          const isLockError = error.message && (
+            error.message.includes('Lock wait timeout') || 
+            error.message.includes('Deadlock found')
+          );
+          
+          if (isLockError && attempt < maxRetries) {
+            const delay = Math.pow(2, attempt) * 100; // 200ms, 400ms, 800ms
+            const errorType = error.message.includes('Deadlock') ? 'Deadlock' : 'Lock timeout';
+            console.log(`⏳ ${errorType} en ticket_type ${ticketTypeId}, reintento ${attempt}/${maxRetries} en ${delay}ms`);
+            await this.sleep(delay);
+            continue; // Reintentar
+          }
+          
+          // Si no es lock error o ya no hay más reintentos, loguear y lanzar error
+          await logError('transaction', 'Error al crear transacción vía SQS', data.id, { 
+            error: error.message,
+            ticket_type_id: data.ticket_type_id,
+            quantity: data.quantity,
+            attempt,
+            maxRetries
+          });
+          
+          throw error;
         }
-        
-      } catch (error) {
-        // Si es error de lock (timeout o deadlock) y quedan reintentos, esperar con exponential backoff
-        const isLockError = error.message && (
-          error.message.includes('Lock wait timeout') || 
-          error.message.includes('Deadlock found')
-        );
-        
-        if (isLockError && attempt < maxRetries) {
-          const delay = Math.pow(2, attempt) * 100; // 200ms, 400ms, 800ms
-          const errorType = error.message.includes('Deadlock') ? 'Deadlock' : 'Lock timeout';
-          console.log(`⏳ ${errorType} en ticket_type ${ticketTypeId}, reintento ${attempt}/${maxRetries} en ${delay}ms`);
-          await this.sleep(delay);
-          continue; // Reintentar
-        }
-        
-        // Si no es lock timeout o ya no hay más reintentos, loguear y lanzar error
-        await logError('transaction', 'Error al crear transacción vía SQS', data.id, { 
-          error: error.message,
-          ticket_type_id: data.ticket_type_id,
-          quantity: data.quantity,
-          attempt,
-          maxRetries
-        });
-        
-        throw error;
       }
+    } finally {
+      // SIEMPRE liberar el lock al final, haya éxito o error
+      this.releaseLock(ticketTypeId);
     }
   }
 
