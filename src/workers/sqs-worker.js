@@ -67,11 +67,12 @@ class SQSWorker {
         // Recibir mensajes (long polling)
         const messages = await sqsService.receiveMessages(queueName);
 
-        // Procesar mensajes en paralelo
+        // Procesar mensajes SECUENCIALMENTE para respetar locks por ticket_type
+        // Evita que múltiples mensajes del mismo ticket_type compitan en la BD
         if (messages.length > 0) {
-          await Promise.all(
-            messages.map(message => this.processMessage(queueName, message))
-          );
+          for (const message of messages) {
+            await this.processMessage(queueName, message);
+          }
         }
 
       } catch (error) {
