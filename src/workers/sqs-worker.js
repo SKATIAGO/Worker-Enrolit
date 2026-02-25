@@ -1,5 +1,9 @@
 import { sqsService } from '../services/sqs.service.js';
 import { TransactionModel } from '../models/transaction.model.js';
+import { ParticipantModel } from '../models/participant.model.js';
+import { SettingsModel } from '../models/settings.model.js';
+import { brevoService } from '../services/brevo.service.js';
+import { getPool } from '../services/database.js';
 import { logInfo, logError } from '../utils/logger.js';
 
 /**
@@ -171,18 +175,108 @@ class SQSWorker {
   async processNotificationMessage(message) {
     const { type, data } = message.body;
 
-    console.log(`📧 Procesando notificación ${type}:`, data);
+    console.log(`📧 Procesando notificación ${type}`);
 
-    // TODO: Implementar envío de emails, SMS, push notifications, etc.
-    // Aquí puedes agregar integraciones con:
-    // - AWS SES para emails
-    // - AWS SNS para SMS
-    // - Firebase para push notifications
-    // - Webhooks a servicios externos
-    // - Actualización de CRM
-    // - Analytics/tracking
+    switch(type) {
+      case 'payment_confirmed':
+        await this.sendPaymentConfirmationEmail(data);
+        break;
+      
+      // Futuros tipos de notificaciones
+      case 'race_reminder':
+        // TODO: Email de recordatorio pre-carrera
+        break;
+      
+      case 'results_available':
+        // TODO: Email con resultados
+        break;
+      
+      default:
+        console.warn(`⚠️  Tipo de notificación desconocido: ${type}`);
+    }
 
-    await logInfo('notification', `Notificación ${type} procesada`, null, { type, recipientEmail: data.email });
+    await logInfo('notification', `Notificación ${type} procesada`, null, { 
+      type, 
+      recipient_email: data.buyer_email 
+    });
+  }
+
+  /**
+   * Enviar email de confirmación de pago con números de corredor
+   */
+  async sendPaymentConfirmationEmail(data) {
+    try {
+      const {
+        transaction_id,
+        buyer_email,
+        buyer_name,
+        race_id,
+        participants // Ya incluye bib_number
+      } = data;
+      
+      console.log(`📧 Enviando confirmación de pago a ${buyer_email} (${participants.length} participantes)`);
+      
+      // Verificar si está habilitado el envío
+      const shouldSend = await SettingsModel.shouldSendPaymentConfirmation();
+      if (!shouldSend) {
+        console.log('📭 Envío de confirmación deshabilitado por configuración');
+        return;
+      }
+      
+      // Obtener información completa de la carrera
+      const pool = getPool();
+      const [races] = await pool.query(
+        `SELECT 
+          title, 
+          start_date, 
+          location,
+          image_url,
+          kit_pickup_info,
+          exoneration_url
+         FROM races 
+         WHERE id = ?`,
+        [race_id]
+      );
+      
+      if (!races || races.length === 0) {
+        throw new Error(`Carrera no encontrada: ${race_id}`);
+      }
+      
+      const race = races[0];
+      
+      // Enviar email con Brevo
+      await brevoService.sendPaymentConfirmation({
+        buyer_email,
+        buyer_name,
+        race_title: race.title,
+        race_date: race.start_date,
+        race_location: race.location,
+        race_image_url: race.image_url,
+        kit_pickup_info: race.kit_pickup_info,
+        exoneration_url: race.exoneration_url,
+        participants
+      });
+      
+      console.log(`✅ Email enviado exitosamente a ${buyer_email}`);
+      
+      // Loguear envío
+      await logInfo('email', 'Email de confirmación enviado', transaction_id, {
+        recipient: buyer_email,
+        participant_count: participants.length,
+        race_title: race.title
+      });
+      
+    } catch (error) {
+      console.error(`❌ Error al enviar email de confirmación:`, error);
+      
+      await logError('email', 'Error al enviar confirmación', data.transaction_id, {
+        error: error.message,
+        recipient: data.buyer_email
+      });
+      
+      // Re-lanzar error para que SQS reintente
+      throw error;
+    }
   }
 
   /**

@@ -1,10 +1,13 @@
 import { getPool } from '../services/database.js';
 import { v4 as uuidv4 } from 'uuid';
-import { logInfo, logError, logWarning } from '../utils/logger.js';
+import { AuditService } from '../services/audit.service.js';
+import { ParticipantModel } from './participant.model.js';
+import { SettingsModel } from './settings.model.js';
+import { sqsService } from '../services/sqs.service.js';
 
 /**
  * Modelo para gestionar transacciones de compra de tickets
- * Versión simplificada para el Worker (solo operaciones de escritura)
+ * Maneja los estados: creado -> procesando -> revision -> completado/erroneo
  */
 export class TransactionModel {
   
@@ -16,22 +19,21 @@ export class TransactionModel {
     const connection = await pool.getConnection();
     
     try {
-      // Timeout reducido ya que no usamos SELECT FOR UPDATE
-      // Solo el UPDATE atómico necesita un lock breve
-      await connection.query('SET SESSION innodb_lock_wait_timeout = 5');
+      // Timeout de 10 segundos para la transacción
+      await connection.query('SET SESSION innodb_lock_wait_timeout = 10');
       
       await connection.beginTransaction();
       
       // Generar UUID para la transacción (o usar el proporcionado si viene de SQS)
       const transactionId = transactionData.id || uuidv4();
       
-      // Verificar disponibilidad de tickets SIN BLOQUEO (optimista)
-      // El bloqueo real ocurrirá en el UPDATE atómico más adelante
+      // Verificar disponibilidad de tickets CON BLOQUEO
       const [ticketType] = await connection.query(
         `SELECT tt.*, r.status as race_status, r.id as race_id 
          FROM ticket_types tt 
          JOIN races r ON tt.race_id = r.id 
-         WHERE tt.id = ? AND tt.is_active = TRUE`,
+         WHERE tt.id = ? AND tt.is_active = TRUE
+         FOR UPDATE`,
         [transactionData.ticket_type_id]
       );
       
@@ -41,7 +43,7 @@ export class TransactionModel {
       
       const ticket = ticketType[0];
       
-      // Validación optimista (puede cambiar antes del UPDATE, pero el UPDATE validará)
+      // Validar disponibilidad ANTES de insertar
       const availableNow = ticket.available_quantity - ticket.sold_quantity;
       if (availableNow < transactionData.quantity) {
         throw new Error(`Solo quedan ${availableNow} tickets disponibles (solicitaste ${transactionData.quantity})`);
@@ -58,11 +60,11 @@ export class TransactionModel {
       const statusHistory = JSON.stringify([{
         status: 'creado',
         timestamp: new Date().toISOString(),
-        note: 'Transacción creada vía SQS Worker'
+        note: 'Transacción creada desde formulario'
       }]);
       
       // Insertar transacción
-      await connection.query(
+      const [result] = await connection.query(
         `INSERT INTO transactions (
           id, race_id, ticket_type_id, quantity,
           buyer_name, buyer_email, buyer_phone, buyer_dni, buyer_data,
@@ -91,9 +93,7 @@ export class TransactionModel {
       
       console.log(`📝 Transacción ${transactionId} creada, reservando ${transactionData.quantity} tickets...`);
       
-      // ACTUALIZACIÓN ATÓMICA: Reservar tickets solo si hay disponibilidad
-      // Este UPDATE es el único punto de bloqueo, pero es muy breve (milisegundos)
-      // Si múltiples workers intentan actualizar simultáneamente, solo uno tendrá éxito
+      // Reservar tickets (incrementar sold_quantity CON VALIDACIÓN)
       const [updateResult] = await connection.query(
         `UPDATE ticket_types 
          SET sold_quantity = sold_quantity + ? 
@@ -103,43 +103,41 @@ export class TransactionModel {
       
       // CRÍTICO: Verificar que se actualizó una fila
       if (updateResult.affectedRows === 0) {
-        // Otro worker se adelantó o no hay tickets suficientes
-        await logError('ticket_type', 'No se pudieron reservar tickets (posible sobreventa o race condition)', transactionData.ticket_type_id, { 
-          transaction_id: transactionId,
-          requested_quantity: transactionData.quantity
-        });
-        throw new Error('No hay tickets suficientes disponibles en este momento. Por favor, intenta nuevamente.');
+        await AuditService.logCriticalError('ticket_type', transactionData.ticket_type_id, 
+          new Error('Sobreventa detectada'), 
+          { 
+            transaction_id: transactionId,
+            requested_quantity: transactionData.quantity,
+            available: availableNow
+          }
+        );
+        throw new Error('No se pudieron reservar los tickets (posible sobreventa detectada)');
       }
       
-      await logInfo('transaction', 'Transacción creada vía SQS', transactionId, { 
-        ticket_type_id: transactionData.ticket_type_id,
-        quantity: transactionData.quantity 
-      });
+      // Registrar reserva en auditoría
+      await AuditService.logTicketReservation(
+        transactionData.ticket_type_id, 
+        transactionData.quantity, 
+        transactionId,
+        transactionData.ip_address
+      );
       
       console.log(`✅ ${transactionData.quantity} tickets reservados exitosamente para transacción ${transactionId}`);
       
       await connection.commit();
       
-      // Devolver objeto con datos básicos
-      return {
-        id: transactionId,
-        race_id: ticket.race_id,
-        ticket_type_id: transactionData.ticket_type_id,
-        quantity: transactionData.quantity,
-        total_amount: totalAmount,
-        currency: ticket.currency,
-        status: 'creado'
-      };
+      // Obtener transacción creada
+      return await this.findById(transactionId);
       
     } catch (error) {
       await connection.rollback();
       console.error(`❌ Error creando transacción: ${error.message}`);
       
-      if (transactionData.id) {
-        await logError('transaction', 'Error al crear transacción vía SQS', transactionData.id, { 
-          error: error.message,
-          ticket_type_id: transactionData.ticket_type_id,
-          quantity: transactionData.quantity
+      // Registrar error crítico
+      if (transactionId) {
+        await AuditService.logCriticalError('transaction', transactionId, error, {
+          operation: 'create',
+          buyer_email: transactionData.buyer_email
         });
       }
       
@@ -150,7 +148,35 @@ export class TransactionModel {
   }
   
   /**
-   * Actualizar estado de la transacción
+   * Buscar transacción por ID
+   */
+  static async findById(transactionId) {
+    const pool = getPool();
+    const [rows] = await pool.query(
+      `SELECT t.*, 
+              r.name as race_name, r.event_date,
+              tt.name as ticket_type_name, tt.price as unit_price
+       FROM transactions t
+       JOIN races r ON t.race_id = r.id
+       JOIN ticket_types tt ON t.ticket_type_id = tt.id
+       WHERE t.id = ?`,
+      [transactionId]
+    );
+    
+    if (rows.length === 0) return null;
+    
+    // Parsear campos JSON
+    const transaction = rows[0];
+    transaction.buyer_data = JSON.parse(transaction.buyer_data || '{}');
+    transaction.status_history = JSON.parse(transaction.status_history || '[]');
+    transaction.metadata = JSON.parse(transaction.metadata || '{}');
+    transaction.payment_gateway_response = JSON.parse(transaction.payment_gateway_response || '{}');
+    
+    return transaction;
+  }
+  
+  /**
+   * Actualizar estado de la transacción (con optimistic locking)
    */
   static async updateStatus(transactionId, newStatus, additionalData = {}) {
     const pool = getPool();
@@ -171,6 +197,9 @@ export class TransactionModel {
       
       const transaction = rows[0];
       const currentStatusHistory = JSON.parse(transaction.status_history || '[]');
+      
+      // Validar transición de estado
+      this._validateStatusTransition(transaction.status, newStatus);
       
       // Agregar al historial
       currentStatusHistory.push({
@@ -220,18 +249,131 @@ export class TransactionModel {
       
       // CRÍTICO: Verificar optimistic locking
       if (updateResult.affectedRows === 0) {
-        await logError('transaction', 'Conflicto de versión optimista', transactionId, { 
-          attempted_transition: `${transaction.status} -> ${newStatus}`,
-          expected_version: transaction.version
-        });
-        throw new Error('Conflicto de versión: la transacción fue modificada por otro proceso.');
+        await AuditService.logCriticalError('transaction', transactionId,
+          new Error('Conflicto de versión optimista'),
+          { 
+            attempted_transition: `${transaction.status} -> ${newStatus}`,
+            expected_version: transaction.version
+          }
+        );
+        throw new Error('Conflicto de versión: la transacción fue modificada por otro proceso. Intenta de nuevo.');
       }
       
-      await logInfo('transaction', `Estado actualizado: ${transaction.status} -> ${newStatus}`, transactionId);
+      // Registrar cambio de estado en auditoría
+      await AuditService.logTransactionStatusChange(
+        transactionId,
+        transaction.status,
+        newStatus,
+        { note: additionalData.note, version: updates.version }
+      );
       
       console.log(`📝 Transacción ${transactionId} actualizada: ${transaction.status} -> ${newStatus}`);
       
-      // Si el estado es completado, incrementar participantes de la carrera
+      // ========================================================================
+      // ESTADO: REVISION - Generar números de corredor y encolar notificación
+      // ========================================================================
+      if (newStatus === 'revision') {
+        console.log(`🎫 Generando números de corredor para transacción ${transactionId}...`);
+        
+        // 1. Obtener configuración del ticket_type y último número
+        const bibInfo = await ParticipantModel.getLastBibNumber(
+          transaction.race_id, 
+          transaction.ticket_type_id,
+          connection
+        );
+        
+        // 2. Extraer participantes de buyer_data
+        const buyerData = JSON.parse(transaction.buyer_data || '{}');
+        const participants = buyerData.participants || [];
+        
+        if (participants.length === 0) {
+          // Si no hay participants array, crear uno con los datos del comprador
+          participants.push({
+            first_name: transaction.buyer_name.split(' ')[0],
+            last_name: transaction.buyer_name.split(' ').slice(1).join(' '),
+            email: transaction.buyer_email,
+            phone: transaction.buyer_phone,
+            dni: transaction.buyer_dni
+          });
+        }
+        
+        // 3. Generar números de corredor consecutivos
+        const startBib = bibInfo.lastBib + 1;
+        const padding = bibInfo.padding;
+        const createdParticipants = [];
+        
+        for (let i = 0; i < participants.length; i++) {
+          const bibNumber = String(startBib + i).padStart(padding, '0');
+          const participant = participants[i];
+          
+          // Crear participante en BD
+          const participantData = {
+            transaction_id: transactionId,
+            race_id: transaction.race_id,
+            bib_number: bibNumber,
+            first_name: participant.first_name,
+            last_name: participant.last_name,
+            email: participant.email,
+            phone: participant.phone,
+            dni: participant.dni,
+            tshirt_size: participant.tshirt_size,
+            emergency_contact: participant.emergency_contact,
+            emergency_phone: participant.emergency_phone
+          };
+          
+          await ParticipantModel.create(participantData);
+          createdParticipants.push({ ...participant, bib_number: bibNumber });
+          
+          console.log(`✅ Participante ${participant.first_name} ${participant.last_name} - Número: ${bibNumber}`);
+        }
+        
+        // 4. Encolar notificación de email
+        if (sqsService.enabled) {
+          await sqsService.sendMessage('notifications', {
+            type: 'payment_confirmed',
+            data: {
+              transaction_id: transactionId,
+              buyer_email: transaction.buyer_email,
+              buyer_name: transaction.buyer_name,
+              race_id: transaction.race_id,
+              participants: createdParticipants
+            }
+          });
+          console.log(`📧 Email de confirmación encolado para ${transaction.buyer_email}`);
+        }
+        
+        // 5. Verificar si debe auto-completarse
+        const autoComplete = await SettingsModel.isAutoCompleteEnabled();
+        if (autoComplete) {
+          console.log(`⚡ Auto-complete habilitado, pasando a estado completado...`);
+          
+          // Actualizar a completado (recursivo, pero con control de versión)
+          const [autoCompleteResult] = await connection.query(
+            `UPDATE transactions 
+             SET status = 'completado', 
+                 completed_at = NOW(),
+                 version = version + 1
+             WHERE id = ? AND version = ?`,
+            [transactionId, updates.version]
+          );
+          
+          if (autoCompleteResult.affectedRows > 0) {
+            // Incrementar participantes de la carrera
+            await connection.query(
+              `UPDATE races 
+               SET current_participants = current_participants + ? 
+               WHERE id = ?`,
+              [transaction.quantity, transaction.race_id]
+            );
+            
+            console.log(`✅ Transacción auto-completada: ${transactionId}`);
+          }
+        }
+      }
+      
+      // ========================================================================
+      // ESTADO: COMPLETADO - Incrementar participantes de la carrera
+      // ========================================================================
       if (newStatus === 'completado') {
         await connection.query(
           `UPDATE races 
@@ -246,109 +388,213 @@ export class TransactionModel {
       if (newStatus === 'erroneo' || newStatus === 'cancelado') {
         const [releaseResult] = await connection.query(
           `UPDATE ticket_types 
-           SET sold_quantity = GREATEST(0, sold_quantity - ?)
+           SET sold_quantity = sold_quantity - ? 
            WHERE id = ? AND sold_quantity >= ?`,
           [transaction.quantity, transaction.ticket_type_id, transaction.quantity]
         );
         
         if (releaseResult.affectedRows === 0) {
-          await logWarning('ticket_type', 'No se pudieron liberar tickets', transaction.ticket_type_id, {
-            transaction_id: transactionId,
-            quantity: transaction.quantity
-          });
+          console.warn(`⚠️  No se pudieron liberar ${transaction.quantity} tickets del tipo ${transaction.ticket_type_id}`);
         } else {
-          await logInfo('ticket_type', 'Tickets liberados', transaction.ticket_type_id, {
-            transaction_id: transactionId,
-            quantity: transaction.quantity,
-            reason: newStatus
-          });
+          // Registrar liberación en auditoría
+          await AuditService.logTicketRelease(
+            transaction.ticket_type_id,
+            transaction.quantity,
+            transactionId,
+            newStatus
+          );
           console.log(`🔓 ${transaction.quantity} tickets liberados (transacción ${newStatus})`);
         }
       }
       
       await connection.commit();
       
-      return {
-        id: transactionId,
-        status: newStatus,
-        updated_at: new Date()
-      };
+      return await this.findById(transactionId);
       
     } catch (error) {
       await connection.rollback();
-      console.error(`❌ Error actualizando transacción ${transactionId}:`, error.message);
       throw error;
     } finally {
       connection.release();
     }
   }
-
+  
   /**
-   * Marcar transacción como pagada
+   * Validar transición de estados
    */
-  static async markAsPaid(transactionId, paymentData) {
-    return await this.updateStatus(transactionId, 'completado', {
-      payment_gateway_transaction_id: paymentData.transactionId || paymentData.payment_gateway_transaction_id,
-      payment_method: paymentData.payment_method || 'paypal',
-      payment_gateway_response: paymentData.response || paymentData,
-      note: 'Pago confirmado'
-    });
+  static _validateStatusTransition(currentStatus, newStatus) {
+    const validTransitions = {
+      'creado': ['procesando', 'cancelado'],
+      'procesando': ['revision', 'erroneo', 'cancelado'],
+      'revision': ['completado', 'erroneo'],
+      'completado': [],
+      'erroneo': [],
+      'cancelado': []
+    };
+    
+    if (!validTransitions[currentStatus]) {
+      throw new Error(`Estado actual inválido: ${currentStatus}`);
+    }
+    
+    if (!validTransitions[currentStatus].includes(newStatus)) {
+      throw new Error(
+        `Transición inválida: ${currentStatus} -> ${newStatus}. ` +
+        `Transiciones válidas: ${validTransitions[currentStatus].join(', ')}`
+      );
+    }
+  }
+  
+  /**
+   * Listar transacciones con filtros
+   */
+  static async findAll(filters = {}, pagination = { page: 1, limit: 50 }) {
+    const pool = getPool();
+    
+    const conditions = [];
+    const params = [];
+    
+    if (filters.status) {
+      conditions.push('t.status = ?');
+      params.push(filters.status);
+    }
+    
+    if (filters.race_id) {
+      conditions.push('t.race_id = ?');
+      params.push(filters.race_id);
+    }
+    
+    if (filters.buyer_email) {
+      conditions.push('t.buyer_email = ?');
+      params.push(filters.buyer_email);
+    }
+    
+    if (filters.payment_gateway_transaction_id) {
+      conditions.push('t.payment_gateway_transaction_id = ?');
+      params.push(filters.payment_gateway_transaction_id);
+    }
+    
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    
+    const offset = (pagination.page - 1) * pagination.limit;
+    
+    const [rows] = await pool.query(
+      `SELECT t.id, t.race_id, t.status, t.buyer_name, t.buyer_email,
+              t.total_amount, t.currency, t.quantity, t.created_at, t.updated_at,
+              r.name as race_name, tt.name as ticket_type_name
+       FROM transactions t
+       JOIN races r ON t.race_id = r.id
+       JOIN ticket_types tt ON t.ticket_type_id = tt.id
+       ${whereClause}
+       ORDER BY t.created_at DESC
+       LIMIT ? OFFSET ?`,
+      [...params, pagination.limit, offset]
+    );
+    
+    const [countResult] = await pool.query(
+      `SELECT COUNT(*) as total FROM transactions t ${whereClause}`,
+      params
+    );
+    
+    return {
+      data: rows,
+      pagination: {
+        page: pagination.page,
+        limit: pagination.limit,
+        total: countResult[0].total,
+        totalPages: Math.ceil(countResult[0].total / pagination.limit)
+      }
+    };
   }
 
   /**
-   * Actualizar datos de la transacción
+   * Buscar transacciones abandonadas (en "procesando" más tiempo del permitido)
+   * @param {number} timeoutMinutes - Minutos después de los cuales se considera abandonada
+   * @returns {Array} Lista de transacciones abandonadas
    */
-  static async update(transactionId, updateData) {
+  static async findAbandoned(timeoutMinutes = 30) {
     const pool = getPool();
     
+    const [rows] = await pool.query(`
+      SELECT t.*, 
+             TIMESTAMPDIFF(MINUTE, t.processed_at, NOW()) as minutes_elapsed,
+             r.name as race_name, 
+             tt.name as ticket_type_name
+      FROM transactions t
+      JOIN races r ON t.race_id = r.id
+      JOIN ticket_types tt ON t.ticket_type_id = tt.id
+      WHERE t.status = 'procesando'
+        AND t.processed_at IS NOT NULL
+        AND TIMESTAMPDIFF(MINUTE, t.processed_at, NOW()) >= ?
+      ORDER BY t.processed_at ASC
+    `, [timeoutMinutes]);
+
+    return rows;
+  }
+
+  /**
+   * Cancelar una transacción y liberar sus tickets
+   * @param {string} transactionId - UUID de la transacción
+   * @param {string} reason - Razón de la cancelación
+   * @returns {Object} Transacción actualizada
+   */
+  static async cancel(transactionId, reason = 'Cancelación manual') {
+    const pool = getPool();
+    const connection = await pool.getConnection();
+    
     try {
-      const fields = [];
-      const values = [];
-      
-      if (updateData.buyer_name) {
-        fields.push('buyer_name = ?');
-        values.push(updateData.buyer_name);
-      }
-      
-      if (updateData.buyer_email) {
-        fields.push('buyer_email = ?');
-        values.push(updateData.buyer_email);
-      }
-      
-      if (updateData.buyer_phone) {
-        fields.push('buyer_phone = ?');
-        values.push(updateData.buyer_phone);
-      }
-      
-      if (updateData.buyer_dni) {
-        fields.push('buyer_dni = ?');
-        values.push(updateData.buyer_dni);
-      }
-      
-      if (updateData.buyer_data) {
-        fields.push('buyer_data = ?');
-        values.push(JSON.stringify(updateData.buyer_data));
-      }
-      
-      if (fields.length === 0) {
-        throw new Error('No hay datos para actualizar');
-      }
-      
-      fields.push('updated_at = NOW()');
-      values.push(transactionId);
-      
-      await pool.query(
-        `UPDATE transactions SET ${fields.join(', ')} WHERE id = ?`,
-        values
+      await connection.beginTransaction();
+
+      // Obtener transacción con bloqueo
+      const [rows] = await connection.query(
+        'SELECT * FROM transactions WHERE id = ? FOR UPDATE',
+        [transactionId]
       );
+
+      if (rows.length === 0) {
+        throw new Error('Transacción no encontrada');
+      }
+
+      const transaction = rows[0];
+
+      // Validar que se puede cancelar
+      if (!['creado', 'procesando'].includes(transaction.status)) {
+        throw new Error(`No se puede cancelar una transacción en estado "${transaction.status}"`);
+      }
+
+      // Liberar tickets si están reservados
+      if (transaction.quantity > 0) {
+        await connection.query(`
+          UPDATE ticket_types
+          SET sold_quantity = GREATEST(0, sold_quantity - ?)
+          WHERE id = ?
+        `, [transaction.quantity, transaction.ticket_type_id]);
+
+        await AuditService.logTicketRelease(
+          transaction.ticket_type_id,
+          transaction.quantity,
+          transactionId,
+          reason
+        );
+      }
+
+      // Actualizar transacción a cancelado
+      await this.updateStatus(transactionId, 'cancelado', {
+        note: reason,
+        metadata: { cancelled_at: new Date().toISOString() }
+      });
+
+      await connection.commit();
+
+      console.log(`✅ Transacción ${transactionId} cancelada: ${reason}`);
       
-      await logInfo('transaction', 'Datos actualizados', transactionId, { fields: Object.keys(updateData) });
-      
-      return { id: transactionId, updated: true };
-      
+      return await this.findById(transactionId);
+
     } catch (error) {
-      console.error(`❌ Error actualizando transacción ${transactionId}:`, error.message);
+      await connection.rollback();
+      console.error(`❌ Error cancelando transacción ${transactionId}:`, error.message);
       throw error;
+    } finally {
+      connection.release();
     }
   }
 }
