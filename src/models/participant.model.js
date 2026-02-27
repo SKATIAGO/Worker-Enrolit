@@ -139,7 +139,7 @@ export class ParticipantModel {
       throw new Error('Tipo de ticket no encontrado');
     }
     
-    const startNumber = ticketType[0].bib_number_start ?? 1;
+    const startNumber = (ticketType[0].bib_number_start > 0 ? ticketType[0].bib_number_start : null) ?? 1;
     const endNumber   = ticketType[0].bib_number_end ?? null;
     
     // Calcular padding automáticamente desde bib_number_end
