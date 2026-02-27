@@ -347,17 +347,35 @@ class SQSWorker {
       throw new Error(`Estado de pago desconocido: ${status}`);
     }
 
-    // Actualizar transacción con retry automático
-    const updatedTransaction = await TransactionModel.updateStatus(
-      transaction_id,
-      newStatus,
-      {
-        payment_gateway_transaction_id,
-        payment_gateway_response: gateway_response,
-        payment_method,
-        note
+    // Actualizar transacción con retry para lock errors
+    const maxRetries = 3;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        await TransactionModel.updateStatus(
+          transaction_id,
+          newStatus,
+          {
+            payment_gateway_transaction_id,
+            payment_gateway_response: gateway_response,
+            payment_method,
+            note
+          }
+        );
+        break; // Éxito, salir del loop
+      } catch (error) {
+        const isLockError = error.message && (
+          error.message.includes('Lock wait timeout') ||
+          error.message.includes('Deadlock found')
+        );
+        if (isLockError && attempt < maxRetries) {
+          const delay = 200 * Math.pow(2, attempt - 1); // 200ms, 400ms
+          console.log(`🔄 Lock error en webhook, reintento ${attempt}/${maxRetries} en ${delay}ms...`);
+          await new Promise(r => setTimeout(r, delay));
+        } else {
+          throw error;
+        }
       }
-    );
+    }
 
     await logInfo('webhook', `Webhook procesado: transacción ${transaction_id} → ${newStatus}`, transaction_id, {
       payment_gateway,

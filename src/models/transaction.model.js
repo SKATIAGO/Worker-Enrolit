@@ -276,6 +276,13 @@ export class TransactionModel {
         try {
           console.log(`🎫 Generando números de corredor para transacción ${transactionId}...`);
           
+          // 0. Adquirir lock sobre ticket_type para serializar asignación de bib numbers
+          //    entre múltiples instancias del worker (el lock in-memory solo protege dentro del mismo proceso)
+          await connection.query(
+            'SELECT id FROM ticket_types WHERE id = ? FOR UPDATE',
+            [transaction.ticket_type_id]
+          );
+          
           // 1. Obtener configuración del ticket_type y último número
           const bibInfo = await ParticipantModel.getLastBibNumber(
             transaction.race_id, 
