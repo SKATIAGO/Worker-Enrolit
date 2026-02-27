@@ -183,13 +183,16 @@ export class ParticipantModel {
     // 3. Obtener el último bib_number asignado para este ticket_type
     //    SIN FOR UPDATE — transactions ya está bloqueada por la
     //    transacción externa (FOR UPDATE sobre ticket_types en transaction.model.js)
-    //    Subquery evita contención de locks
+    //    Solo contar participantes de transacciones VÁLIDAS (revision/completado),
+    //    no de transacciones erroneas/canceladas que dejaron ghost records
     const [lastRows] = await pool.query(
       `SELECT rp.bib_number
        FROM race_participants rp
        WHERE rp.race_id = ?
          AND rp.transaction_id IN (
-           SELECT id FROM transactions WHERE ticket_type_id = ?
+           SELECT id FROM transactions
+           WHERE ticket_type_id = ?
+             AND status IN ('revision', 'completado')
          )
        ORDER BY CAST(rp.bib_number AS UNSIGNED) DESC
        LIMIT 1`,
