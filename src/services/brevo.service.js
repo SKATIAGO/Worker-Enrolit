@@ -1,4 +1,5 @@
 import axios from 'axios';
+import QRCode from 'qrcode';
 import { logInfo, logError } from '../utils/logger.js';
 import { SettingsModel } from '../models/settings.model.js';
 
@@ -37,8 +38,9 @@ class BrevoService {
   
   /**
    * Enviar email transaccional con HTML personalizado
+   * @param {Array} attachments - Adjuntos inline [{name, content (base64), contentId}]
    */
-  async sendEmail({ to, subject, htmlContent, replyTo = null }) {
+  async sendEmail({ to, subject, htmlContent, attachments = [], replyTo = null }) {
     if (!this.enabled) {
       console.log('📭 Brevo deshabilitado, email no enviado:', to.email);
       return { success: false, reason: 'BREVO_DISABLED' };
@@ -52,7 +54,7 @@ class BrevoService {
     }
     
     try {
-      const response = await this.client.post('/smtp/email', {
+      const payload = {
         sender: {
           name: this.fromName,
           email: this.fromEmail
@@ -66,7 +68,18 @@ class BrevoService {
         subject,
         htmlContent,
         replyTo: replyTo ? { email: replyTo } : undefined
-      });
+      };
+
+      // Adjuntos inline (QR codes con cid:) — Brevo los embebe en el email
+      if (attachments.length > 0) {
+        payload.attachment = attachments.map(a => ({
+          name: a.name,
+          content: a.content,   // base64 PNG
+          contentId: a.contentId
+        }));
+      }
+
+      const response = await this.client.post('/smtp/email', payload);
       
       await logInfo('brevo', 'Email enviado exitosamente', null, {
         to: to.email,
@@ -92,19 +105,26 @@ class BrevoService {
   }
   
   /**
-   * Genera URL pública de QR usando api.qrserver.com
-   * Los emails bloquean data:base64 URIs — este método devuelve una URL HTTPS
-   * que todos los clientes de email cargan sin restricciones.
+   * Genera un QR como buffer PNG y lo devuelve en base64
+   * Se adjunta al email como inline attachment y se referencia con cid:
+   * Esto es el estándar MIME para imágenes embebidas — funciona en todos los clientes
    */
-  _generateQRUrl(text) {
-    const encoded = encodeURIComponent(text);
-    return `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encoded}&color=0056D6&bgcolor=FFFFFF&margin=10&format=png`;
+  async _generateQRBuffer(text) {
+    const buffer = await QRCode.toBuffer(text, {
+      errorCorrectionLevel: 'H',
+      type: 'png',
+      margin: 2,
+      width: 220,
+      color: { dark: '#0056D6', light: '#ffffff' }
+    });
+    return buffer.toString('base64');
   }
 
   /**
    * Generar HTML de confirmación de pago con diseño moderno Enrolit + QR
+   * Devuelve { html, attachments } donde attachments son los QR inline (cid:)
    */
-  async generatePaymentConfirmationHTML(data) {
+  async generatePaymentConfirmationEmail(data) {
     const {
       transaction_id,
       race_title,
@@ -121,11 +141,22 @@ class BrevoService {
       weekday: 'long', day: 'numeric', month: 'long', year: 'numeric'
     });
 
-    // Generar bloque HTML por cada participante con su QR único
-    const participantsHTML = participants.map((p, idx) => {
-      // El valor del QR contiene los datos necesarios para validar en el evento
+    // Generar QRs y construir bloques HTML por participante
+    const attachments = [];
+    const participantsHTML = await Promise.all(participants.map(async (p, idx) => {
       const qrValue = `ENROLIT|TX:${transaction_id}|BIB:${p.bib_number}|DNI:${p.dni || ''}`;
-      const qrUrl = this._generateQRUrl(qrValue);
+      const contentId = `qr_p${idx}`;
+
+      try {
+        const qrBase64 = await this._generateQRBuffer(qrValue);
+        attachments.push({
+          name: `qr-${p.bib_number || idx}.png`,
+          content: qrBase64,
+          contentId
+        });
+      } catch (e) {
+        console.error(`⚠️  Error generando QR para participante ${idx}:`, e.message);
+      }
 
       return `
       <!-- Participante ${idx + 1} -->
@@ -165,7 +196,7 @@ class BrevoService {
                 <td style="padding: 20px 24px; text-align: center;">
                   <p style="margin: 0 0 12px; font-family: Arial, sans-serif; font-size: 12px; font-weight: 700; color: #666; letter-spacing: 1.5px; text-transform: uppercase;">Presenta este QR en la entrega de kit</p>
                   <div style="display: inline-block; background: white; padding: 12px; border-radius: 12px; border: 2px solid #e8f0fe; box-shadow: 0 4px 12px rgba(0,86,214,0.12);">
-                    <img src="${qrUrl}" alt="QR Kit ${p.bib_number}" width="180" height="180" style="display: block; border: 0;"/>
+                    <img src="cid:${contentId}" alt="QR Kit ${p.bib_number}" width="180" height="180" style="display: block; border: 0;"/>
                   </div>
                   <p style="margin: 10px 0 0; font-family: Arial, sans-serif; font-size: 11px; color: #999;">ID: ${transaction_id.split('-')[0].toUpperCase()}...${p.bib_number}</p>
                 </td>
@@ -175,9 +206,9 @@ class BrevoService {
           </td>
         </tr>
       </table>`;
-    });
+    }));
 
-    return `<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+    const html = `<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
 <html xmlns="http://www.w3.org/1999/xhtml">
 <head>
   <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
@@ -287,6 +318,8 @@ class BrevoService {
 
 </body>
 </html>`;
+
+    return { html, attachments };
   }
 
   /**
@@ -299,12 +332,13 @@ class BrevoService {
       race_title,
     } = data;
 
-    const htmlContent = await this.generatePaymentConfirmationHTML(data);
+    const { html, attachments } = await this.generatePaymentConfirmationEmail(data);
 
     return await this.sendEmail({
       to: { email: buyer_email, name: buyer_name },
       subject: `✅ Confirmación de Inscripción - ${race_title}`,
-      htmlContent
+      htmlContent: html,
+      attachments
     });
   }
 }
