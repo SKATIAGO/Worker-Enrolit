@@ -23,6 +23,7 @@
     "axios": "^1.13.5",
     "dotenv": "^16.4.5",
     "mysql2": "^3.11.5",
+    "qrcode": "^1.5.4",
     "uuid": "^11.0.3"
   },
   "devDependencies": {

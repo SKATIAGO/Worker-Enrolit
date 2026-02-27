@@ -246,6 +246,7 @@ class SQSWorker {
       
       // Enviar email con Brevo
       await brevoService.sendPaymentConfirmation({
+        transaction_id,
         buyer_email,
         buyer_name,
         race_title: race.title,
