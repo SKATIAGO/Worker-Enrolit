@@ -348,25 +348,28 @@ export class TransactionModel {
           if (autoComplete) {
             console.log(`⚡ Auto-complete habilitado, pasando a estado completado...`);
             
-            // Actualizar a completado (recursivo, pero con control de versión)
+            // Agregar transición al historial
+            currentStatusHistory.push({
+              from: 'revision',
+              to: 'completado',
+              timestamp: new Date().toISOString(),
+              note: 'Auto-completado por configuración'
+            });
+            
             const [autoCompleteResult] = await connection.query(
               `UPDATE transactions 
                SET status = 'completado', 
                    completed_at = NOW(),
+                   status_history = ?,
                    version = version + 1
                WHERE id = ? AND version = ?`,
-              [transactionId, updates.version]
+              [JSON.stringify(currentStatusHistory), transactionId, updates.version]
             );
             
             if (autoCompleteResult.affectedRows > 0) {
-              // Incrementar participantes de la carrera
-              await connection.query(
-                `UPDATE races 
-                 SET current_participants = current_participants + ? 
-                 WHERE id = ?`,
-                [transaction.quantity, transaction.race_id]
-              );
-              
+              // Mutar newStatus para que el bloque de 'completado' abajo
+              // se encargue de incrementar current_participants (un solo lugar)
+              newStatus = 'completado';
               console.log(`✅ Transacción auto-completada: ${transactionId}`);
             }
           }
@@ -544,68 +547,24 @@ export class TransactionModel {
 
   /**
    * Cancelar una transacción y liberar sus tickets
+   * Delega a updateStatus() que ya maneja la liberación de tickets
+   * para estados 'cancelado' y 'erroneo'
    * @param {string} transactionId - UUID de la transacción
    * @param {string} reason - Razón de la cancelación
    * @returns {Object} Transacción actualizada
    */
   static async cancel(transactionId, reason = 'Cancelación manual') {
-    const pool = getPool();
-    const connection = await pool.getConnection();
-    
-    try {
-      await connection.beginTransaction();
-
-      // Obtener transacción con bloqueo
-      const [rows] = await connection.query(
-        'SELECT * FROM transactions WHERE id = ? FOR UPDATE',
-        [transactionId]
-      );
-
-      if (rows.length === 0) {
-        throw new Error('Transacción no encontrada');
-      }
-
-      const transaction = rows[0];
-
-      // Validar que se puede cancelar
-      if (!['creado', 'procesando'].includes(transaction.status)) {
-        throw new Error(`No se puede cancelar una transacción en estado "${transaction.status}"`);
-      }
-
-      // Liberar tickets si están reservados
-      if (transaction.quantity > 0) {
-        await connection.query(`
-          UPDATE ticket_types
-          SET sold_quantity = GREATEST(0, sold_quantity - ?)
-          WHERE id = ?
-        `, [transaction.quantity, transaction.ticket_type_id]);
-
-        await AuditService.logTicketRelease(
-          transaction.ticket_type_id,
-          transaction.quantity,
-          transactionId,
-          reason
-        );
-      }
-
-      // Actualizar transacción a cancelado
-      await this.updateStatus(transactionId, 'cancelado', {
-        note: reason,
-        metadata: { cancelled_at: new Date().toISOString() }
-      });
-
-      await connection.commit();
-
-      console.log(`✅ Transacción ${transactionId} cancelada: ${reason}`);
-      
-      return await this.findById(transactionId);
-
-    } catch (error) {
-      await connection.rollback();
-      console.error(`❌ Error cancelando transacción ${transactionId}:`, error.message);
-      throw error;
-    } finally {
-      connection.release();
-    }
+    // updateStatus() ya maneja:
+    // - Obtener conexión + beginTransaction
+    // - FOR UPDATE sobre transactions 
+    // - Validar transición de estado (solo creado/procesando → cancelado)
+    // - Liberar tickets (sold_quantity - quantity)
+    // - Registrar en auditoría
+    // - commit + release
+    // NO duplicar lógica aquí para evitar DEADLOCK
+    return await this.updateStatus(transactionId, 'cancelado', {
+      note: reason,
+      metadata: { cancelled_at: new Date().toISOString() }
+    });
   }
 }

@@ -41,18 +41,31 @@ export class ParticipantModel {
         ]
       );
       
-      await logInfo('participant', 'Participante creado', participantId, {
-        bib_number: participantData.bib_number,
-        race_id: participantData.race_id
-      });
+      // logInfo en try-catch: no debe romper la creación si falla
+      try {
+        await logInfo('participant', 'Participante creado', participantId, {
+          bib_number: participantData.bib_number,
+          race_id: participantData.race_id
+        });
+      } catch (logErr) {
+        console.warn(`⚠️  Error en log de participante ${participantId}:`, logErr.message);
+      }
       
-      return await this.findById(participantId);
+      // NO hacer findById aquí: si estamos dentro de una transacción,
+      // la fila aún no tiene commit y otra conexión no la verá.
+      // Retornar los datos directamente.
+      return { id: participantId, ...participantData };
       
     } catch (error) {
-      await logError('participant', 'Error al crear participante', participantId, {
-        error: error.message,
-        bib_number: participantData.bib_number
-      });
+      // logError en try-catch: no debe enmascarar el error original
+      try {
+        await logError('participant', 'Error al crear participante', participantId, {
+          error: error.message,
+          bib_number: participantData.bib_number
+        });
+      } catch (logErr) {
+        console.warn(`⚠️  Error en logError de participante:`, logErr.message);
+      }
       throw error;
     }
   }
@@ -75,7 +88,7 @@ export class ParticipantModel {
   static async findByTransactionId(transactionId) {
     const pool = getPool();
     const [rows] = await pool.query(
-      `SELECT p.*, r.title as race_title, r.start_date as race_date
+      `SELECT p.*, r.name as race_title, r.event_date as race_date
        FROM race_participants p
        JOIN races r ON p.race_id = r.id
        WHERE p.transaction_id = ?
@@ -127,42 +140,69 @@ export class ParticipantModel {
       await connection.query('SET SESSION innodb_lock_wait_timeout = 30');
     }
     
-    // Obtener configuración del tipo de ticket (rango mín/máx)
-    const [ticketType] = await pool.query(
-      `SELECT bib_number_start, bib_number_end
-       FROM ticket_types 
-       WHERE id = ?`,
-      [ticketTypeId]
-    );
+    // 1. Obtener TODA la configuración del ticket_type en una sola query
+    //    bib_number_end puede no existir (migración 08), se maneja con fallback
+    let ticketTypeConfig;
+    try {
+      const [rows] = await pool.query(
+        `SELECT bib_number_start, bib_number_padding, bib_number_end
+         FROM ticket_types 
+         WHERE id = ?`,
+        [ticketTypeId]
+      );
+      ticketTypeConfig = rows[0];
+    } catch (e) {
+      // Si bib_number_end no existe, consultar sin ella
+      const [rows] = await pool.query(
+        `SELECT bib_number_start, bib_number_padding
+         FROM ticket_types 
+         WHERE id = ?`,
+        [ticketTypeId]
+      );
+      ticketTypeConfig = rows[0];
+      console.warn(`⚠️  bib_number_end no disponible, usando sin límite`);
+    }
     
-    if (!ticketType || ticketType.length === 0) {
+    if (!ticketTypeConfig) {
       throw new Error('Tipo de ticket no encontrado');
     }
     
-    const startNumber = (ticketType[0].bib_number_start > 0 ? ticketType[0].bib_number_start : null) ?? 1;
-    const endNumber   = ticketType[0].bib_number_end ?? null;
+    const startNumber = (ticketTypeConfig.bib_number_start > 0 ? ticketTypeConfig.bib_number_start : null) ?? 1;
+    const endNumber = ticketTypeConfig.bib_number_end ?? null;
     
-    // Calcular padding automáticamente desde bib_number_end
-    // Si end=1000 → 4 dígitos → '0001'. Si null, usar 4 por defecto.
-    const padding = endNumber
-      ? String(endNumber).length
-      : String(startNumber).length > 4 ? String(startNumber).length : 4;
+    // 2. Calcular padding: usar bib_number_padding de BD o calcularlo automáticamente
+    let padding = (ticketTypeConfig.bib_number_padding > 0)
+      ? ticketTypeConfig.bib_number_padding
+      : null;
+    if (!padding) {
+      padding = endNumber
+        ? String(endNumber).length
+        : String(startNumber).length > 4 ? String(startNumber).length : 4;
+    }
     
-    // Obtener el último número asignado para este ticket_type CON LOCK
-    const [result] = await pool.query(
-      `SELECT COALESCE(MAX(CAST(rp.bib_number AS UNSIGNED)), ?) as last_bib
+    // 3. Obtener el último bib_number asignado para este ticket_type
+    //    SIN FOR UPDATE — transactions ya está bloqueada por la
+    //    transacción externa (FOR UPDATE sobre ticket_types en transaction.model.js)
+    //    Subquery evita contención de locks
+    const [lastRows] = await pool.query(
+      `SELECT rp.bib_number
        FROM race_participants rp
-       JOIN transactions t ON rp.transaction_id = t.id
        WHERE rp.race_id = ?
-         AND t.ticket_type_id = ?
-       FOR UPDATE`,
-      [startNumber - 1, raceId, ticketTypeId]
+         AND rp.transaction_id IN (
+           SELECT id FROM transactions WHERE ticket_type_id = ?
+         )
+       ORDER BY CAST(rp.bib_number AS UNSIGNED) DESC
+       LIMIT 1`,
+      [raceId, ticketTypeId]
     );
     
-    const lastBib = result[0].last_bib;
+    const lastBib = lastRows.length > 0
+      ? Number(lastRows[0].bib_number)
+      : startNumber - 1;
+    
     const nextBib = lastBib + 1;
     
-    // Validar que no se exceda el rango máximo
+    // 4. Validar que no se exceda el rango máximo
     if (endNumber !== null && nextBib > endNumber) {
       throw new Error(
         `Rango de números de corredor agotado para este tipo de ticket ` +
