@@ -1,5 +1,4 @@
 import axios from 'axios';
-import QRCode from 'qrcode';
 import { logInfo, logError } from '../utils/logger.js';
 import { SettingsModel } from '../models/settings.model.js';
 
@@ -93,20 +92,13 @@ class BrevoService {
   }
   
   /**
-   * Genera un QR como base64 data URI para insertar inline en el email
+   * Genera URL pública de QR usando api.qrserver.com
+   * Los emails bloquean data:base64 URIs — este método devuelve una URL HTTPS
+   * que todos los clientes de email cargan sin restricciones.
    */
-  async _generateQRDataURL(text) {
-    try {
-      return await QRCode.toDataURL(text, {
-        errorCorrectionLevel: 'H',
-        type: 'image/png',
-        margin: 2,
-        width: 200,
-        color: { dark: '#0056D6', light: '#ffffff' }
-      });
-    } catch {
-      return null;
-    }
+  _generateQRUrl(text) {
+    const encoded = encodeURIComponent(text);
+    return `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encoded}&color=0056D6&bgcolor=FFFFFF&margin=10&format=png`;
   }
 
   /**
@@ -130,10 +122,10 @@ class BrevoService {
     });
 
     // Generar bloque HTML por cada participante con su QR único
-    const participantsHTML = await Promise.all(participants.map(async (p, idx) => {
+    const participantsHTML = participants.map((p, idx) => {
       // El valor del QR contiene los datos necesarios para validar en el evento
       const qrValue = `ENROLIT|TX:${transaction_id}|BIB:${p.bib_number}|DNI:${p.dni || ''}`;
-      const qrDataURL = await this._generateQRDataURL(qrValue);
+      const qrUrl = this._generateQRUrl(qrValue);
 
       return `
       <!-- Participante ${idx + 1} -->
@@ -172,12 +164,10 @@ class BrevoService {
               <tr>
                 <td style="padding: 20px 24px; text-align: center;">
                   <p style="margin: 0 0 12px; font-family: Arial, sans-serif; font-size: 12px; font-weight: 700; color: #666; letter-spacing: 1.5px; text-transform: uppercase;">Presenta este QR en la entrega de kit</p>
-                  ${qrDataURL ? `
                   <div style="display: inline-block; background: white; padding: 12px; border-radius: 12px; border: 2px solid #e8f0fe; box-shadow: 0 4px 12px rgba(0,86,214,0.12);">
-                    <img src="${qrDataURL}" alt="QR Kit ${p.bib_number}" width="180" height="180" style="display: block; border: 0;"/>
+                    <img src="${qrUrl}" alt="QR Kit ${p.bib_number}" width="180" height="180" style="display: block; border: 0;"/>
                   </div>
                   <p style="margin: 10px 0 0; font-family: Arial, sans-serif; font-size: 11px; color: #999;">ID: ${transaction_id.split('-')[0].toUpperCase()}...${p.bib_number}</p>
-                  ` : `<p style="color: #999; font-size: 12px;">QR no disponible</p>`}
                 </td>
               </tr>
             </table>
@@ -185,7 +175,7 @@ class BrevoService {
           </td>
         </tr>
       </table>`;
-    }));
+    });
 
     return `<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
 <html xmlns="http://www.w3.org/1999/xhtml">
