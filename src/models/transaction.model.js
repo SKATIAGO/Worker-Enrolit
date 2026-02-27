@@ -27,13 +27,14 @@ export class TransactionModel {
       // Generar UUID para la transacción (o usar el proporcionado si viene de SQS)
       const transactionId = transactionData.id || uuidv4();
       
-      // Verificar disponibilidad de tickets CON BLOQUEO
+      // Verificar disponibilidad de tickets (lectura sin bloqueo)
+      // La protección contra sobreventa la da el UPDATE atómico posterior
+      // con WHERE (sold_quantity + ?) <= available_quantity
       const [ticketType] = await connection.query(
         `SELECT tt.*, r.status as race_status, r.id as race_id 
          FROM ticket_types tt 
          JOIN races r ON tt.race_id = r.id 
-         WHERE tt.id = ? AND tt.is_active = TRUE
-         FOR UPDATE`,
+         WHERE tt.id = ? AND tt.is_active = TRUE`,
         [transactionData.ticket_type_id]
       );
       
@@ -273,15 +274,21 @@ export class TransactionModel {
       // ESTADO: REVISION - Generar números de corredor y encolar notificación
       // ========================================================================
       if (newStatus === 'revision') {
+        const lockName = `bib_lock_${transaction.ticket_type_id}`;
         try {
           console.log(`🎫 Generando números de corredor para transacción ${transactionId}...`);
           
-          // 0. Adquirir lock sobre ticket_type para serializar asignación de bib numbers
-          //    entre múltiples instancias del worker (el lock in-memory solo protege dentro del mismo proceso)
-          await connection.query(
-            'SELECT id FROM ticket_types WHERE id = ? FOR UPDATE',
-            [transaction.ticket_type_id]
+          // 0. Adquirir advisory lock para serializar asignación de bib numbers
+          //    entre múltiples instancias del worker.
+          //    Usa GET_LOCK en vez de FOR UPDATE sobre ticket_types para evitar
+          //    deadlocks con create() que también opera sobre esa tabla.
+          const [lockResult] = await connection.query(
+            'SELECT GET_LOCK(?, 10) as locked',
+            [lockName]
           );
+          if (!lockResult[0].locked) {
+            throw new Error(`No se pudo adquirir lock para asignar bib numbers (ticket_type ${transaction.ticket_type_id})`);
+          }
           
           // 1. Obtener configuración del ticket_type y último número
           const bibInfo = await ParticipantModel.getLastBibNumber(
@@ -335,6 +342,9 @@ export class TransactionModel {
             console.log(`✅ Participante ${participant.first_name} ${participant.last_name} - Número: ${bibNumber}`);
           }
           
+          // Liberar advisory lock tan pronto como los bib numbers estén asignados
+          await connection.query('SELECT RELEASE_LOCK(?) as released', [lockName]);
+          
           // 4. Encolar notificación de email
           if (sqsService.enabled) {
             await sqsService.sendMessage('notifications', {
@@ -381,6 +391,8 @@ export class TransactionModel {
             }
           }
         } catch (error) {
+          // Liberar advisory lock en caso de error
+          try { await connection.query('SELECT RELEASE_LOCK(?) as released', [lockName]); } catch (_) {}
           console.error(`❌ Error generando participantes para transacción ${transactionId}:`, error);
           await AuditService.logCriticalError('transaction', transactionId, error, {
             step: 'participant_generation',

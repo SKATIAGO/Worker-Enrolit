@@ -181,8 +181,8 @@ export class ParticipantModel {
     }
     
     // 3. Obtener el último bib_number asignado para este ticket_type
-    //    SIN FOR UPDATE — transactions ya está bloqueada por la
-    //    transacción externa (FOR UPDATE sobre ticket_types en transaction.model.js)
+    //    SIN FOR UPDATE — la serialización de bib numbers se hace con
+    //    advisory lock (GET_LOCK) en transaction.model.js
     //    Solo contar participantes de transacciones VÁLIDAS (revision/completado),
     //    no de transacciones erroneas/canceladas que dejaron ghost records
     const [lastRows] = await pool.query(
