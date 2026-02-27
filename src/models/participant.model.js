@@ -116,7 +116,7 @@ export class ParticipantModel {
   }
   
   /**
-   * Obtener el último número de corredor asignado en una carrera
+   * Obtener el último número de corredor asignado para un ticket_type
    * Usa FOR UPDATE para evitar colisiones en asignaciones concurrentes
    */
   static async getLastBibNumber(raceId, ticketTypeId, connection = null) {
@@ -127,9 +127,9 @@ export class ParticipantModel {
       await connection.query('SET SESSION innodb_lock_wait_timeout = 30');
     }
     
-    // Obtener configuración del tipo de ticket
+    // Obtener configuración del tipo de ticket (rango mín/máx)
     const [ticketType] = await pool.query(
-      `SELECT bib_number_start, bib_number_padding 
+      `SELECT bib_number_start, bib_number_end
        FROM ticket_types 
        WHERE id = ?`,
       [ticketTypeId]
@@ -139,20 +139,43 @@ export class ParticipantModel {
       throw new Error('Tipo de ticket no encontrado');
     }
     
-    const startNumber = ticketType[0].bib_number_start || 1000;
+    const startNumber = ticketType[0].bib_number_start ?? 1;
+    const endNumber   = ticketType[0].bib_number_end ?? null;
     
-    // Obtener el último número asignado CON LOCK
+    // Calcular padding automáticamente desde bib_number_end
+    // Si end=1000 → 4 dígitos → '0001'. Si null, usar 4 por defecto.
+    const padding = endNumber
+      ? String(endNumber).length
+      : String(startNumber).length > 4 ? String(startNumber).length : 4;
+    
+    // Obtener el último número asignado para este ticket_type CON LOCK
     const [result] = await pool.query(
-      `SELECT COALESCE(MAX(CAST(bib_number AS UNSIGNED)), ?) as last_bib 
-       FROM race_participants 
-       WHERE race_id = ?
+      `SELECT COALESCE(MAX(CAST(rp.bib_number AS UNSIGNED)), ?) as last_bib
+       FROM race_participants rp
+       JOIN transactions t ON rp.transaction_id = t.id
+       WHERE rp.race_id = ?
+         AND t.ticket_type_id = ?
        FOR UPDATE`,
-      [startNumber - 1, raceId]
+      [startNumber - 1, raceId, ticketTypeId]
     );
     
+    const lastBib = result[0].last_bib;
+    const nextBib = lastBib + 1;
+    
+    // Validar que no se exceda el rango máximo
+    if (endNumber !== null && nextBib > endNumber) {
+      throw new Error(
+        `Rango de números de corredor agotado para este tipo de ticket ` +
+        `(${startNumber}-${endNumber}). No quedan números disponibles.`
+      );
+    }
+    
     return {
-      lastBib: result[0].last_bib,
-      padding: ticketType[0].bib_number_padding || 4
+      lastBib,
+      padding,
+      startNumber,
+      endNumber,
+      available: endNumber !== null ? endNumber - lastBib : null
     };
   }
   
