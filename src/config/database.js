@@ -6,7 +6,7 @@ export const dbConfig = {
   password: process.env.DB_PASSWORD || '',
   database: process.env.DB_NAME || 'enrolit_db',
   waitForConnections: true,
-  connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT || '2'),  // 2 × 10 max instancias = 20 conexiones (db.t3.micro ≈ 85 max)
+  connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT || '5'),
   queueLimit: 0,
   enableKeepAlive: true,
   keepAliveInitialDelay: 0,
