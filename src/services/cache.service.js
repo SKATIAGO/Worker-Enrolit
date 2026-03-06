@@ -142,6 +142,32 @@ class CacheService {
       }
     }
   }
+
+  /**
+   * Incrementar una key numérica
+   */
+  async incrBy(key, amount) {
+    if (!this.isConnected || !this.isEnabled) return null;
+    try {
+      return await this.client.incrBy(key, amount);
+    } catch (error) {
+      console.error(`Error en incrBy [${key}]:`, error.message);
+      return null;
+    }
+  }
+
+  /**
+   * Decrementar una key numérica
+   */
+  async decrBy(key, amount) {
+    if (!this.isConnected || !this.isEnabled) return null;
+    try {
+      return await this.client.decrBy(key, amount);
+    } catch (error) {
+      console.error(`Error en decrBy [${key}]:`, error.message);
+      return null;
+    }
+  }
 }
 
 export const cacheService = new CacheService();

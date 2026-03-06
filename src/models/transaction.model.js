@@ -209,6 +209,9 @@ export class TransactionModel {
   static async updateStatus(transactionId, newStatus, additionalData = {}) {
     const pool = getPool();
     const connection = await pool.getConnection();
+    let participantsIncrementedInRedis = false;
+    let stockReleasedInRedis = false;
+    let txRaceId, txQuantity, txTicketTypeId;
     
     try {
       await connection.beginTransaction();
@@ -435,29 +438,32 @@ export class TransactionModel {
       // ESTADO: COMPLETADO - Incrementar participantes de la carrera
       // ========================================================================
       if (newStatus === 'completado') {
+        txRaceId = transaction.race_id;
+        txQuantity = transaction.quantity;
+        // Solo Redis INCRBY (atómico). El sync job persiste a DB cada 30s.
+        // NO hacer DB += aquí para evitar doble-conteo si RetryHelper reintenta
+        // tras un deadlock (Redis no se revierte en rollback, DB sí).
         const redisResult = await cacheService.incrParticipants(transaction.race_id, transaction.quantity);
-        await connection.query(
-          `UPDATE races 
-           SET current_participants = current_participants + ? 
-           WHERE id = ?`,
-          [transaction.quantity, transaction.race_id]
-        );
-        console.log(`✅ ${transaction.quantity} participantes agregados a carrera ${transaction.race_id}${redisResult !== null ? ' (Redis+DB)' : ' (DB)'}`);
+        if (redisResult !== null) participantsIncrementedInRedis = true;
+        console.log(`✅ ${transaction.quantity} participantes agregados a carrera ${transaction.race_id}${redisResult !== null ? ' (Redis)' : ' (sin Redis)'}`);
       }
       
       // Si el estado es erroneo o cancelado, liberar tickets
       if (newStatus === 'erroneo' || newStatus === 'cancelado') {
-        // Liberar en Redis
-        await cacheService.releaseStock(transaction.ticket_type_id, transaction.quantity);
+        txTicketTypeId = transaction.ticket_type_id;
+        txQuantity = transaction.quantity;
+        // Solo Redis DECRBY (atómico). El sync job persiste a DB cada 30s.
+        const releaseResult = await cacheService.releaseStock(transaction.ticket_type_id, transaction.quantity);
+        if (releaseResult) stockReleasedInRedis = true;
         
-        const [releaseResult] = await connection.query(
+        const [dbReleaseResult] = await connection.query(
           `UPDATE ticket_types 
            SET sold_quantity = sold_quantity - ? 
            WHERE id = ? AND sold_quantity >= ?`,
           [transaction.quantity, transaction.ticket_type_id, transaction.quantity]
         );
         
-        if (releaseResult.affectedRows === 0) {
+        if (dbReleaseResult.affectedRows === 0) {
           console.warn(`⚠️  No se pudieron liberar ${transaction.quantity} tickets del tipo ${transaction.ticket_type_id}`);
         } else {
           await AuditService.logTicketRelease(
@@ -476,6 +482,13 @@ export class TransactionModel {
       
     } catch (error) {
       await connection.rollback();
+      // Revertir operaciones Redis que no se deshacen con DB rollback
+      if (participantsIncrementedInRedis) {
+        await cacheService.decrBy(`participants:${txRaceId}`, txQuantity).catch(() => {});
+      }
+      if (stockReleasedInRedis) {
+        await cacheService.incrBy(`stock:sold:${txTicketTypeId}`, txQuantity).catch(() => {});
+      }
       throw error;
     } finally {
       connection.release();
