@@ -23,6 +23,8 @@ class SQSWorker {
     // Evita locks cuando múltiples workers actualizan el mismo ticket_type
     this.ticketTypeLocks = new Map();
     this.maxConcurrentPerTicketType = 1; // SERIALIZAR operaciones por ticket_type (0 locks)
+    // Máximo de mensajes procesados en paralelo por ciclo de polling
+    this.messageConcurrency = parseInt(process.env.WORKER_MSG_CONCURRENCY || '5');
   }
 
   /**
@@ -72,11 +74,14 @@ class SQSWorker {
         // Recibir mensajes (long polling)
         const messages = await sqsService.receiveMessages(queueName);
 
-        // Procesar mensajes SECUENCIALMENTE para respetar locks por ticket_type
-        // Evita que múltiples mensajes del mismo ticket_type compitan en la BD
+        // Procesar mensajes en paralelo (hasta messageConcurrency a la vez)
+        // Redis reservaBibRange elimina la necesidad de serializar por ticket_type
         if (messages.length > 0) {
-          for (const message of messages) {
-            await this.processMessage(queueName, message);
+          const concurrency = this.messageConcurrency;
+          for (let i = 0; i < messages.length; i += concurrency) {
+            await Promise.all(
+              messages.slice(i, i + concurrency).map(m => this.processMessage(queueName, m))
+            );
           }
         }
 
