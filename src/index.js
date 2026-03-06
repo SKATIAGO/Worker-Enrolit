@@ -12,6 +12,7 @@
 import 'dotenv/config';
 import { sqsWorker } from './workers/sqs-worker.js';
 import { getPool, initializeDatabase } from './services/database.js';
+import { cacheService } from './services/cache.service.js';
 
 // Configurar manejo de señales para shutdown graceful
 let shutdownInProgress = false;
@@ -38,6 +39,9 @@ async function gracefulShutdown(signal) {
       await pool.end();
       console.log('✅ Conexiones de BD cerradas');
     }
+
+    // Cerrar Redis
+    await cacheService.disconnect();
 
     console.log('✅ Shutdown completado exitosamente');
     process.exit(0);
@@ -87,6 +91,9 @@ async function main() {
 
     console.log('✅ Base de datos conectada y lista');
     console.log('');
+
+    // Conectar a Redis (opcional, no bloquea si falla)
+    await cacheService.connect();
 
     // Iniciar worker SQS
     console.log('🔄 Iniciando procesamiento de colas SQS...');

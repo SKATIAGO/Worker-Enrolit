@@ -4,6 +4,7 @@ import { AuditService } from '../services/audit.service.js';
 import { ParticipantModel } from './participant.model.js';
 import { SettingsModel } from './settings.model.js';
 import { sqsService } from '../services/sqs.service.js';
+import { cacheService } from '../services/cache.service.js';
 
 /**
  * Modelo para gestionar transacciones de compra de tickets
@@ -17,6 +18,7 @@ export class TransactionModel {
   static async create(transactionData) {
     const pool = getPool();
     const connection = await pool.getConnection();
+    let stockReservedInRedis = false;
     
     try {
       // Timeout de 10 segundos para la transacción
@@ -94,25 +96,46 @@ export class TransactionModel {
       
       console.log(`📝 Transacción ${transactionId} creada, reservando ${transactionData.quantity} tickets...`);
       
-      // Reservar tickets (incrementar sold_quantity CON VALIDACIÓN)
-      const [updateResult] = await connection.query(
-        `UPDATE ticket_types 
-         SET sold_quantity = sold_quantity + ? 
-         WHERE id = ? AND (sold_quantity + ?) <= available_quantity`,
-        [transactionData.quantity, transactionData.ticket_type_id, transactionData.quantity]
+      // Reservar stock: intentar primero con Redis (atómico, sub-ms)
+      const redisReservation = await cacheService.reserveStock(
+        transactionData.ticket_type_id,
+        transactionData.quantity,
+        ticket.available_quantity
       );
       
-      // CRÍTICO: Verificar que se actualizó una fila
-      if (updateResult.affectedRows === 0) {
+      if (redisReservation.error === 'sold_out') {
+        const remaining = redisReservation.remaining || 0;
         await AuditService.logCriticalError('ticket_type', transactionData.ticket_type_id, 
           new Error('Sobreventa detectada'), 
-          { 
-            transaction_id: transactionId,
-            requested_quantity: transactionData.quantity,
-            available: availableNow
-          }
+          { transaction_id: transactionId, requested_quantity: transactionData.quantity, remaining }
         );
-        throw new Error('No se pudieron reservar los tickets (posible sobreventa detectada)');
+        throw new Error(remaining > 0 
+          ? `Solo quedan ${remaining} tickets disponibles (solicitaste ${transactionData.quantity})`
+          : 'No se pudieron reservar los tickets (posible sobreventa detectada)'
+        );
+      }
+      
+      if (redisReservation.success) {
+        stockReservedInRedis = true;
+        await connection.query(
+          `UPDATE ticket_types SET sold_quantity = sold_quantity + ? WHERE id = ?`,
+          [transactionData.quantity, transactionData.ticket_type_id]
+        );
+      } else {
+        // Fallback a DB directa si Redis no disponible
+        const [updateResult] = await connection.query(
+          `UPDATE ticket_types 
+           SET sold_quantity = sold_quantity + ? 
+           WHERE id = ? AND (sold_quantity + ?) <= available_quantity`,
+          [transactionData.quantity, transactionData.ticket_type_id, transactionData.quantity]
+        );
+        if (updateResult.affectedRows === 0) {
+          await AuditService.logCriticalError('ticket_type', transactionData.ticket_type_id, 
+            new Error('Sobreventa detectada'), 
+            { transaction_id: transactionId, requested_quantity: transactionData.quantity, available: availableNow }
+          );
+          throw new Error('No se pudieron reservar los tickets (posible sobreventa detectada)');
+        }
       }
       
       // Registrar reserva en auditoría
@@ -132,6 +155,10 @@ export class TransactionModel {
       
     } catch (error) {
       await connection.rollback();
+      // Si Redis ya había reservado pero la tx DB falló, liberar en Redis
+      if (stockReservedInRedis) {
+        await cacheService.releaseStock(transactionData.ticket_type_id, transactionData.quantity);
+      }
       console.error(`❌ Error creando transacción: ${error.message}`);
       
       // Registrar error crítico
@@ -408,17 +435,21 @@ export class TransactionModel {
       // ESTADO: COMPLETADO - Incrementar participantes de la carrera
       // ========================================================================
       if (newStatus === 'completado') {
+        const redisResult = await cacheService.incrParticipants(transaction.race_id, transaction.quantity);
         await connection.query(
           `UPDATE races 
            SET current_participants = current_participants + ? 
            WHERE id = ?`,
           [transaction.quantity, transaction.race_id]
         );
-        console.log(`✅ ${transaction.quantity} participantes agregados a carrera ${transaction.race_id}`);
+        console.log(`✅ ${transaction.quantity} participantes agregados a carrera ${transaction.race_id}${redisResult !== null ? ' (Redis+DB)' : ' (DB)'}`);
       }
       
       // Si el estado es erroneo o cancelado, liberar tickets
       if (newStatus === 'erroneo' || newStatus === 'cancelado') {
+        // Liberar en Redis
+        await cacheService.releaseStock(transaction.ticket_type_id, transaction.quantity);
+        
         const [releaseResult] = await connection.query(
           `UPDATE ticket_types 
            SET sold_quantity = sold_quantity - ? 
@@ -429,7 +460,6 @@ export class TransactionModel {
         if (releaseResult.affectedRows === 0) {
           console.warn(`⚠️  No se pudieron liberar ${transaction.quantity} tickets del tipo ${transaction.ticket_type_id}`);
         } else {
-          // Registrar liberación en auditoría
           await AuditService.logTicketRelease(
             transaction.ticket_type_id,
             transaction.quantity,
