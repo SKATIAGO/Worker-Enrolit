@@ -305,34 +305,23 @@ export class TransactionModel {
       // ========================================================================
       if (newStatus === 'revision') {
         const lockName = `bib_lock_${transaction.ticket_type_id}`;
+        let bibRange = null;
         try {
           console.log(`🎫 Generando números de corredor para transacción ${transactionId}...`);
           
-          // 0. Adquirir advisory lock para serializar asignación de bib numbers
-          //    entre múltiples instancias del worker.
-          //    Usa GET_LOCK en vez de FOR UPDATE sobre ticket_types para evitar
-          //    deadlocks con create() que también opera sobre esa tabla.
-          const [lockResult] = await connection.query(
-            'SELECT GET_LOCK(?, 10) as locked',
-            [lockName]
-          );
-          if (!lockResult[0].locked) {
-            throw new Error(`No se pudo adquirir lock para asignar bib numbers (ticket_type ${transaction.ticket_type_id})`);
-          }
-          
-          // 1. Obtener configuración del ticket_type y último número
+          // 0. Obtener configuración de padding del ticket_type
           const bibInfo = await ParticipantModel.getLastBibNumber(
             transaction.race_id, 
             transaction.ticket_type_id,
             connection
           );
+          const padding = bibInfo.padding;
           
-          // 2. Extraer participantes de buyer_data
+          // 1. Extraer participantes de buyer_data
           const buyerData = JSON.parse(transaction.buyer_data || '{}');
           let participants = buyerData.participants || [];
           
           if (participants.length === 0) {
-            // Si no hay participants array, crear uno con los datos del comprador
             participants = [{
               first_name: transaction.buyer_name.split(' ')[0],
               last_name: transaction.buyer_name.split(' ').slice(1).join(' '),
@@ -342,9 +331,37 @@ export class TransactionModel {
             }];
           }
           
+          // 2. Reservar rango de bibs atómicamente con Redis INCRBY (sin lock)
+          let startBib;
+          bibRange = await cacheService.reserveBibRange(
+            transaction.ticket_type_id,
+            participants.length
+          );
+          
+          if (bibRange) {
+            startBib = bibRange.startBib;
+            if (bibInfo.endNumber !== null && bibRange.endBib > bibInfo.endNumber) {
+              throw new Error(
+                `Rango de números de corredor agotado para este tipo de ticket ` +
+                `(${bibInfo.startNumber}-${bibInfo.endNumber}). No quedan números disponibles.`
+              );
+            }
+          } else {
+            // Fallback: Redis no disponible, usar advisory lock + DB query
+            const [lockResult] = await connection.query(
+              'SELECT GET_LOCK(?, 10) as locked',
+              [lockName]
+            );
+            if (!lockResult[0].locked) {
+              throw new Error(`No se pudo adquirir lock para asignar bib numbers (ticket_type ${transaction.ticket_type_id})`);
+            }
+            const freshBib = await ParticipantModel.getLastBibNumber(
+              transaction.race_id, transaction.ticket_type_id, connection
+            );
+            startBib = freshBib.lastBib + 1;
+          }
+          
           // 3. Generar números de corredor consecutivos
-          const startBib = bibInfo.lastBib + 1;
-          const padding = bibInfo.padding;
           const createdParticipants = [];
           
           for (let i = 0; i < participants.length; i++) {
@@ -372,8 +389,10 @@ export class TransactionModel {
             console.log(`✅ Participante ${participant.first_name} ${participant.last_name} - Número: ${bibNumber}`);
           }
           
-          // Liberar advisory lock tan pronto como los bib numbers estén asignados
-          await connection.query('SELECT RELEASE_LOCK(?) as released', [lockName]);
+          // Liberar advisory lock si se usó (fallback sin Redis)
+          if (!bibRange) {
+            await connection.query('SELECT RELEASE_LOCK(?) as released', [lockName]);
+          }
           
           // 4. Encolar notificación de email
           if (sqsService.enabled) {
@@ -421,8 +440,10 @@ export class TransactionModel {
             }
           }
         } catch (error) {
-          // Liberar advisory lock en caso de error
-          try { await connection.query('SELECT RELEASE_LOCK(?) as released', [lockName]); } catch (_) {}
+          // Liberar advisory lock si se usó (fallback sin Redis)
+          if (!bibRange) {
+            try { await connection.query('SELECT RELEASE_LOCK(?) as released', [lockName]); } catch (_) {}
+          }
           console.error(`❌ Error generando participantes para transacción ${transactionId}:`, error);
           await AuditService.logCriticalError('transaction', transactionId, error, {
             step: 'participant_generation',

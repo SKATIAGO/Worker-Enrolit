@@ -132,6 +132,24 @@ class CacheService {
     }
   }
 
+  /**
+   * Reservar un rango de bib numbers atómicamente.
+   * @param {number} ticketTypeId
+   * @param {number} count
+   * @returns {{ startBib: number, endBib: number } | null}
+   */
+  async reserveBibRange(ticketTypeId, count) {
+    if (!this.isConnected || !this.isEnabled) return null;
+    try {
+      const key = `bib:next:${ticketTypeId}`;
+      const newVal = await this.client.incrBy(key, count);
+      return { startBib: newVal - count + 1, endBib: newVal };
+    } catch (error) {
+      console.error(`Error en reserveBibRange [tt:${ticketTypeId}]:`, error.message);
+      return null;
+    }
+  }
+
   async disconnect() {
     if (this.client && this.isConnected) {
       try {
